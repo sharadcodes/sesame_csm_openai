@@ -7,10 +7,12 @@ An OpenAI-compatible Text-to-Speech API that harnesses the power of Sesame's Con
 - **OpenAI API Compatibility**: Drop-in replacement for OpenAI's TTS API
 - **Multiple Voices**: Six distinct voices (alloy, echo, fable, onyx, nova, shimmer)
 - **Voice Consistency**: Maintains consistent voice characteristics across multiple requests
+- **Voice Cloning**: Clone your own voice from audio samples
 - **Conversational Context**: Supports conversational context for improved naturalness
 - **Multiple Audio Formats**: Supports MP3, OPUS, AAC, FLAC, and WAV
 - **Speed Control**: Adjustable speech speed
 - **CUDA Acceleration**: GPU support for faster generation
+- **Web UI**: Simple interface for voice cloning and speech generation
 
 ## Getting Started
 
@@ -23,20 +25,17 @@ An OpenAI-compatible Text-to-Speech API that harnesses the power of Sesame's Con
 ### Installation
 
 1. Clone this repository:
-
 ```bash
-git clone https://github.com/phildougherty/csm-tts-api
+git clone https://github.com/yourusername/csm-tts-api
 cd csm-tts-api
 ```
 
 2. Create a `.env` file with your Hugging Face token:
-
 ```
 HF_TOKEN=your_hugging_face_token_here
 ```
 
 3. Build and start the container:
-
 ```bash
 docker compose up -d --build
 ```
@@ -64,6 +63,105 @@ The API uses the following models which are downloaded automatically:
 - **Mimi**: Audio codec for high-quality audio generation
 - **Llama Tokenizer**: Uses the unsloth/Llama-3.2-1B tokenizer for text processing
 
+## Voice Cloning Guide
+
+The CSM-1B TTS API comes with powerful voice cloning capabilities that allow you to create custom voices from audio samples. Here's how to use this feature:
+
+### Method 1: Using the Web Interface
+
+1. Access the voice cloning UI by navigating to `http://your-server-ip:8000/voice-cloning` in your browser.
+
+2. **Clone a Voice**:
+   - Go to the "Clone Voice" tab
+   - Enter a name for your voice
+   - Upload an audio sample (2-3 minutes of clear speech works best)
+   - Optionally provide a transcript of the audio for better results
+   - Click "Clone Voice"
+
+3. **View Your Voices**:
+   - Navigate to the "My Voices" tab to see all your cloned voices
+   - You can preview or delete voices from this tab
+
+4. **Generate Speech**:
+   - Go to the "Generate Speech" tab
+   - Select one of your cloned voices
+   - Enter the text you want to synthesize
+   - Adjust the temperature slider if needed (lower for more consistent results)
+   - Click "Generate Speech" and listen to the result
+
+### Method 2: Using the API
+
+1. **Clone a Voice**:
+```bash
+curl -X POST http://localhost:8000/v1/voice-cloning/clone \
+  -F "name=My Voice" \
+  -F "audio_file=@path/to/your/voice_sample.mp3" \
+  -F "transcript=Optional transcript of the audio sample" \
+  -F "description=A description of this voice"
+```
+
+2. **List Available Cloned Voices**:
+```bash
+curl -X GET http://localhost:8000/v1/voice-cloning/voices
+```
+
+3. **Generate Speech with a Cloned Voice**:
+```bash
+curl -X POST http://localhost:8000/v1/voice-cloning/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "voice_id": "1234567890_my_voice",
+    "text": "This is my cloned voice speaking.",
+    "temperature": 0.7
+  }' \
+  --output cloned_speech.mp3
+```
+
+4. **Generate a Voice Preview**:
+```bash
+curl -X POST http://localhost:8000/v1/voice-cloning/voices/1234567890_my_voice/preview \
+  --output voice_preview.mp3
+```
+
+5. **Delete a Cloned Voice**:
+```bash
+curl -X DELETE http://localhost:8000/v1/voice-cloning/voices/1234567890_my_voice
+```
+
+### Voice Cloning Best Practices
+
+For the best voice cloning results:
+
+1. **Use High-Quality Audio**: Record in a quiet environment with minimal background noise and echo.
+
+2. **Provide Sufficient Length**: 2-3 minutes of speech provides better results than shorter samples.
+
+3. **Clear, Natural Speech**: Speak naturally at a moderate pace with clear pronunciation.
+
+4. **Include Various Intonations**: Sample should contain different sentence types (statements, questions) for better expressiveness.
+
+5. **Add a Transcript**: While optional, providing an accurate transcript of your recording helps the model better capture your voice characteristics.
+
+6. **Adjust Temperature**: For more consistent results, use lower temperature values (0.6-0.7). For more expressiveness, use higher values (0.7-0.9).
+
+7. **Try Multiple Samples**: If you're not satisfied with the results, try recording a different sample or adjusting the speaking style.
+
+### Using Cloned Voices with the Standard TTS Endpoint
+
+Cloned voices are automatically available through the standard OpenAI-compatible endpoint. Simply use the voice ID or name as the `voice` parameter:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "csm-1b",
+    "input": "This is my cloned voice speaking through the standard endpoint.",
+    "voice": "1234567890_my_voice",
+    "response_format": "mp3"
+  }' \
+  --output cloned_speech.mp3
+```
+
 ## How the Voices Work
 
 Unlike traditional TTS systems with pre-trained voice models, CSM-1B works differently:
@@ -80,7 +178,7 @@ Unlike traditional TTS systems with pre-trained voice models, CSM-1B works diffe
   - **nova**: Warm and smooth
   - **shimmer**: Light and airy with higher frequencies
 
-The voice system can be extended with your own voice samples by modifying the `voice_embeddings.py` file.
+The voice system can be extended with your own voice samples by using the voice cloning feature.
 
 ## API Usage
 
@@ -102,23 +200,40 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 ### Available Endpoints
 
+#### Standard TTS Endpoints
 - `GET /v1/audio/models` - List available models
-- `GET /v1/audio/voices` - List available voices
+- `GET /v1/audio/voices` - List available voices (including cloned voices)
 - `GET /v1/audio/speech/response-formats` - List available response formats
 - `POST /v1/audio/speech` - Generate speech from text
 - `POST /api/v1/audio/conversation` - Advanced endpoint for conversational speech
 
+#### Voice Cloning Endpoints
+- `POST /v1/voice-cloning/clone` - Clone a new voice from an audio sample
+- `GET /v1/voice-cloning/voices` - List all cloned voices
+- `POST /v1/voice-cloning/generate` - Generate speech with a cloned voice
+- `POST /v1/voice-cloning/voices/{voice_id}/preview` - Generate a preview of a cloned voice
+- `DELETE /v1/voice-cloning/voices/{voice_id}` - Delete a cloned voice
+
 ### Request Parameters
 
+#### Standard TTS
 | Parameter | Description | Type | Default |
 |-----------|-------------|------|---------|
 | `model` | Model ID to use | string | "csm-1b" |
 | `input` | The text to convert to speech | string | Required |
-| `voice` | The voice to use | string | "alloy" |
+| `voice` | The voice to use (standard or cloned voice ID) | string | "alloy" |
 | `response_format` | Audio format | string | "mp3" |
 | `speed` | Speech speed multiplier | float | 1.0 |
-| `temperature` | Sampling temperature | float | 0.9 |
+| `temperature` | Sampling temperature | float | 0.8 |
 | `max_audio_length_ms` | Maximum audio length in ms | integer | 90000 |
+
+#### Voice Cloning
+| Parameter | Description | Type | Default |
+|-----------|-------------|------|---------|
+| `name` | Name for the cloned voice | string | Required |
+| `audio_file` | Audio sample file | file | Required |
+| `transcript` | Transcript of the audio | string | Optional |
+| `description` | Description of the voice | string | Optional |
 
 ### Available Voices
 
@@ -128,6 +243,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 - `onyx` - Deep and resonant
 - `nova` - Warm and smooth
 - `shimmer` - Light and airy
+- `[cloned voice ID]` - Any voice you've cloned using the voice cloning feature
 
 ### Response Formats
 
@@ -151,16 +267,9 @@ OpenWebUI is a popular open-source UI for AI models that supports custom TTS end
 
 Once configured, OpenWebUI will use your CSM-1B TTS API for all text-to-speech conversion, producing high-quality speech with the selected voice.
 
-### OpenWebUI Voice Selection
+### Using Cloned Voices with OpenWebUI
 
-In OpenWebUI, you can select different voices through the UI's voice selector. The voices will map directly to the CSM-1B voices:
-
-- **Alloy** - General purpose voice with balanced tone
-- **Echo** - Resonant voice with a deeper quality
-- **Fable** - Upbeat, brighter voice for creative content
-- **Onyx** - Deep, authoritative voice
-- **Nova** - Warm, pleasant midrange voice
-- **Shimmer** - Light, higher-pitched voice
+Your cloned voices will automatically appear in OpenWebUI's voice selector. Simply choose your cloned voice from the dropdown menu in the TTS settings or chat interface.
 
 ## Advanced Usage
 
@@ -194,6 +303,7 @@ For fine-grained control, you can adjust:
 - `temperature` (0.0-1.0): Higher values produce more variation but may be less stable
 - `topk` (1-100): Controls diversity of generated speech
 - `max_audio_length_ms`: Maximum length of generated audio in milliseconds
+- `voice_consistency` (0.0-1.0): How strongly to maintain voice characteristics across segments
 
 ## Troubleshooting
 
@@ -207,7 +317,15 @@ For fine-grained control, you can adjust:
 
 - Try different voices - some may work better for your specific text
 - Adjust temperature (lower for more stable output)
-- For longer texts, split into smaller chunks
+- For longer texts, the API automatically splits into smaller chunks for better quality
+- For cloned voices, try recording a cleaner audio sample
+
+### Voice Cloning Issues
+
+- **Poor Voice Quality**: Try recording in a quieter environment with less background noise
+- **Inconsistent Voice**: Provide a longer and more varied audio sample (2-3 minutes)
+- **Accent Issues**: Make sure your sample contains similar words/sounds to what you'll be generating
+- **Low Volume**: The sample is normalized automatically, but ensure it's not too quiet or distorted
 
 ### Voice Inconsistency
 

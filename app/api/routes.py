@@ -1,3 +1,6 @@
+"""
+API routes for the CSM-1B TTS API.
+"""
 import os
 import io
 import base64
@@ -9,7 +12,7 @@ from typing import Dict, List, Optional, Any, Union
 import torch
 import torchaudio
 import numpy as np
-from fastapi import APIRouter, Request, Response, Depends, HTTPException, Body
+from fastapi import APIRouter, Request, Response, HTTPException, Body
 from fastapi.responses import StreamingResponse
 
 from app.api.schemas import TTSRequest, ResponseFormat, Voice
@@ -57,6 +60,7 @@ async def text_to_speech(
     
     # Handle voice parameter
     voice_name = body.get("voice", "alloy")
+    
     # Convert string voice name to speaker ID
     try:
         if voice_name in ["0", "1", "2", "3", "4", "5"]:
@@ -75,12 +79,26 @@ async def text_to_speech(
             }
             speaker = voice_map[voice_name]
         else:
-            # Check if it's a custom voice in voice profiles
-            from app.voice_enhancement import VOICE_PROFILES
-            if voice_name in VOICE_PROFILES:
-                speaker = VOICE_PROFILES[voice_name].speaker_id
-            else:
-                # Default to speaker 0
+            # Check if this is a cloned voice
+            cloned_voice_id = None
+            if hasattr(request.app.state, "voice_cloner"):
+                # Check if the voice name is a cloned voice ID
+                voice_cloner = request.app.state.voice_cloner
+                if voice_name in voice_cloner.cloned_voices:
+                    cloned_voice_id = voice_name
+                    speaker = voice_cloner.cloned_voices[voice_name].speaker_id
+                    logger.info(f"Using cloned voice: {voice_name} with speaker ID: {speaker}")
+                else:
+                    # Check if the voice name matches a cloned voice name
+                    for voice_id, voice in voice_cloner.cloned_voices.items():
+                        if voice.name.lower() == voice_name.lower():
+                            cloned_voice_id = voice_id
+                            speaker = voice.speaker_id
+                            logger.info(f"Found cloned voice by name: {voice_name} (ID: {cloned_voice_id})")
+                            break
+            
+            # Default to speaker 0 if not found
+            if 'speaker' not in locals():
                 logger.warning(f"Unknown voice '{voice_name}', defaulting to speaker 0")
                 speaker = 0
                 voice_name = "alloy"
@@ -112,12 +130,19 @@ async def text_to_speech(
         
         # Import advanced text and voice processing 
         from app.prompt_engineering import split_into_segments, format_text_for_voice
-        from app.voice_enhancement import get_voice_segments, process_generated_audio
         
-        # Get context segments for this voice
-        context = get_voice_segments(voice_name, generator.device)
-        if context:
-            logger.info(f"Using {len(context)} reference segments for voice consistency")
+        # Get appropriate context
+        if cloned_voice_id and hasattr(request.app.state, "voice_cloner"):
+            # Use cloned voice context
+            context = request.app.state.voice_cloner.get_voice_context(cloned_voice_id)
+            if context:
+                logger.info(f"Using cloned voice context with {len(context)} segments")
+        else:
+            # Use standard voice enhancement context
+            from app.voice_enhancement import get_voice_segments
+            context = get_voice_segments(voice_name, generator.device)
+            if context:
+                logger.info(f"Using {len(context)} reference segments for voice consistency")
         
         # Check if text needs to be split into segments
         # Splitting helps generate more consistent and complete audio
@@ -149,6 +174,7 @@ async def text_to_speech(
             )
             
             # Process audio for quality and consistency
+            from app.voice_enhancement import process_generated_audio
             processed_segment = process_generated_audio(
                 audio_segment,
                 voice_name,
@@ -273,32 +299,6 @@ async def text_to_speech(
         logger.error(f"Speech generation failed: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Speech generation failed: {str(e)}")
 
-@router.post("/audio/voices/create", summary="Create a new voice")
-async def create_voice(
-    request: Request,
-    name: str = Body(..., description="Name of the voice to create"),
-    initial_text: str = Body(..., description="Text for the initial voice sample"),
-    speaker_id: int = Body(0, description="Base speaker ID (0-5)"),
-    pitch: Optional[float] = Body(None, description="Base pitch in Hz (optional)"),
-    timbre: str = Body("custom", description="Voice quality descriptor")
-):
-    """Create a new custom voice."""
-    from app.voice_enhancement import create_custom_voice
-    
-    result = create_custom_voice(
-        app_state=request.app.state,
-        name=name,
-        initial_text=initial_text,
-        speaker_id=speaker_id,
-        pitch=pitch,
-        timbre=timbre
-    )
-    
-    if result["status"] == "error":
-        raise HTTPException(status_code=400, detail=result["message"])
-    
-    return result
-    
 @router.post("/audio/conversation", tags=["Conversation API"])
 async def conversation_to_speech(
     request: Request,
@@ -418,7 +418,7 @@ async def conversation_to_speech(
 
 # Add OpenAI-compatible voice list endpoint
 @router.get("/audio/voices", summary="List available voices")
-async def list_voices():
+async def list_voices(request: Request):
     """
     OpenAI compatible endpoint that returns a list of available voices.
     """
@@ -482,20 +482,18 @@ async def list_voices():
             }
         ]
     
-    # Check for custom voices
-    try:
-        from app.voice_enhancement import get_custom_voices
-        custom_voices = get_custom_voices()
-        for voice in custom_voices:
+    # Add cloned voices if available
+    if hasattr(request.app.state, "voice_cloner"):
+        voice_cloner = request.app.state.voice_cloner
+        for voice in voice_cloner.list_voices():
             voices.append({
-                "voice_id": voice["name"],
-                "name": voice["name"].capitalize(),
-                "preview_url": None,
-                "description": f"Custom voice based on {voice['base_voice']}",
-                "languages": [{"language_code": "en", "name": "English"}]
+                "voice_id": voice.id,
+                "name": voice.name,
+                "preview_url": f"/v1/voice-cloning/voices/{voice.id}/preview",
+                "description": voice.description or f"Cloned voice: {voice.name}",
+                "languages": [{"language_code": "en", "name": "English"}],
+                "cloned": True
             })
-    except (ImportError, AttributeError):
-        pass
     
     return {"voices": voices}
 
@@ -515,7 +513,8 @@ async def list_models():
             "owned_by": "sesame",
             "capabilities": {
                 "tts": True,
-                "voice_generation": False,
+                "voice_generation": True,
+                "voice_cloning": hasattr(router.app, "voice_cloner"),
             },
             "max_input_length": 4096,
             "price": {"text-to-speech": 0.00}
@@ -529,7 +528,7 @@ async def list_models():
             "owned_by": "sesame",
             "capabilities": {
                 "tts": True,
-                "voice_generation": False,
+                "voice_generation": True,
             },
             "max_input_length": 4096,
             "price": {"text-to-speech": 0.00}
@@ -543,7 +542,7 @@ async def list_models():
             "owned_by": "sesame",
             "capabilities": {
                 "tts": True,
-                "voice_generation": False,
+                "voice_generation": True,
             },
             "max_input_length": 4096,
             "price": {"text-to-speech": 0.00}
@@ -583,8 +582,6 @@ async def debug_info(request: Request):
         "model_loaded": generator is not None,
         "device": generator.device if generator is not None else None,
         "sample_rate": generator.sample_rate if generator is not None else None,
-        "voices_available": [v.value for v in Voice],
-        "response_formats": [f.value for f in ResponseFormat],
     }
     
     # Add voice enhancement info if available
@@ -600,6 +597,17 @@ async def debug_info(request: Request):
         debug_info["voice_profiles"] = voice_info
     except ImportError:
         debug_info["voice_profiles"] = "Not available"
+        
+    # Add voice cloning info if available
+    if hasattr(request.app.state, "voice_cloner"):
+        voice_cloner = request.app.state.voice_cloner
+        debug_info["voice_cloning"] = {
+            "enabled": True,
+            "cloned_voices_count": len(voice_cloner.list_voices()),
+            "cloned_voices": [v.name for v in voice_cloner.list_voices()]
+        }
+    else:
+        debug_info["voice_cloning"] = {"enabled": False}
     
     # Add memory usage info for CUDA
     if torch.cuda.is_available():
