@@ -416,7 +416,6 @@ async def conversation_to_speech(
         logger.error(f"Conversation speech generation failed: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Conversation speech generation failed: {str(e)}")
 
-# Add OpenAI-compatible voice list endpoint
 @router.get("/audio/voices", summary="List available voices")
 async def list_voices(request: Request):
     """
@@ -425,17 +424,32 @@ async def list_voices(request: Request):
     # Get voice descriptions from profiles if available
     try:
         from app.voice_enhancement import VOICE_PROFILES
-        voices = [
-            {
+        voices = []
+        
+        for name, profile in VOICE_PROFILES.items():
+            # Check if the profile has the expected attributes
+            if hasattr(profile, 'timbre') and hasattr(profile, 'pitch_range'):
+                description = f"{profile.timbre.capitalize()} voice with {int(profile.pitch_range[0])}-{int(profile.pitch_range[1])}Hz range"
+            else:
+                # Fallback descriptions if attributes are missing
+                descriptions = {
+                    "alloy": "Balanced voice with natural tone",
+                    "echo": "Resonant voice with deeper qualities", 
+                    "fable": "Brighter voice with higher pitch",
+                    "onyx": "Deep, authoritative voice",
+                    "nova": "Warm, pleasant voice with medium range",
+                    "shimmer": "Light, airy voice with higher frequencies"
+                }
+                description = descriptions.get(name, f"Voice: {name}")
+            
+            voices.append({
                 "voice_id": name,
                 "name": name.capitalize(),
                 "preview_url": None,
-                "description": f"{profile.timbre.capitalize()} voice with {int(profile.pitch_range[0])}-{int(profile.pitch_range[1])}Hz range",
+                "description": description,
                 "languages": [{"language_code": "en", "name": "English"}]
-            }
-            for name, profile in VOICE_PROFILES.items()
-        ]
-    except ImportError:
+            })
+    except ImportError or Exception as e:
         # Fallback to basic voice descriptions
         voices = [
             {

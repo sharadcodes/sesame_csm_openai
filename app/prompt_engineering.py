@@ -2,6 +2,10 @@
 import re
 import random
 from typing import List, Dict, Optional
+import logging
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 # Voice style descriptors for consistent prompting
 VOICE_STYLES = {
@@ -34,8 +38,18 @@ VOICE_STYLES = {
         "adjectives": ["light", "airy", "bright", "crystalline", "delicate", "expressive"],
         "characteristics": ["higher pitch", "quick pacing", "light tone", "bright timbre"],
         "speaking_style": "light and expressive"
+    },
+    "custom": {
+        "adjectives": ["clear", "distinct", "authentic", "natural", "personalized", "unique"],
+        "characteristics": ["natural rhythm", "authentic tone", "personal inflection", "distinctive sound"],
+        "speaking_style": "authentic and natural"
     }
 }
+
+def initialize_templates():
+    """Initialize prompt templates - placeholder for any future setup."""
+    logger.info("Prompt templates initialized")
+    return VOICE_STYLES
 
 def split_into_segments(text: str, max_chars: int = 150) -> List[str]:
     """Split text into optimal segments for better generation.
@@ -97,6 +111,7 @@ def split_into_segments(text: str, max_chars: int = 150) -> List[str]:
     if current_segment:
         segments.append(current_segment.strip())
     
+    logger.info(f"Split text into {len(segments)} segments")
     return segments
 
 def format_text_for_voice(text: str, voice_name: str, segment_index: int = 0, total_segments: int = 1) -> str:
@@ -112,7 +127,7 @@ def format_text_for_voice(text: str, voice_name: str, segment_index: int = 0, to
         Formatted text optimized for consistent voice generation
     """
     if voice_name not in VOICE_STYLES:
-        voice_name = "alloy"  # Default fallback
+        voice_name = "custom"  # Default fallback
     
     style = VOICE_STYLES[voice_name]
     
