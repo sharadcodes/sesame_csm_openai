@@ -9,6 +9,7 @@ import io
 import time
 import tempfile
 import logging
+import asyncio
 from typing import Dict, List, Optional, Union, Tuple, BinaryIO
 from pathlib import Path
 
@@ -88,27 +89,50 @@ class VoiceCloner:
         Returns:
             Tuple of (processed_audio, transcript, duration_seconds)
         """
-        # Handle different input types
-        if isinstance(file, str):
-            # It's a file path
-            audio_path = file
-        elif hasattr(file, 'read'):
-            # It's a file-like object
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
-                temp.write(file.read() if hasattr(file, 'read') else file)
-                audio_path = temp.name
-        else:
-            # It's a FastAPI UploadFile
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
-                temp.write(await file.read())
-                audio_path = temp.name
-
+        temp_path = None
+        
         try:
+            # Handle different input types
+            if isinstance(file, str):
+                # It's a file path
+                audio_path = file
+                logger.info(f"Processing audio from file path: {audio_path}")
+            else:
+                # Create a temporary file
+                temp_fd, temp_path = tempfile.mkstemp(suffix=".wav")
+                os.close(temp_fd)  # Close the file descriptor
+                
+                if isinstance(file, UploadFile):
+                    # It's a FastAPI UploadFile
+                    logger.info("Processing audio from UploadFile")
+                    contents = await file.read()
+                    with open(temp_path, "wb") as f:
+                        f.write(contents)
+                elif hasattr(file, 'read'):
+                    # It's a file-like object - check if it's async
+                    logger.info("Processing audio from file-like object")
+                    if asyncio.iscoroutinefunction(file.read):
+                        # It's an async read method
+                        contents = await file.read()
+                    else:
+                        # It's a sync read method
+                        contents = file.read()
+                        
+                    with open(temp_path, "wb") as f:
+                        f.write(contents)
+                else:
+                    raise ValueError(f"Unsupported file type: {type(file)}")
+                
+                audio_path = temp_path
+                logger.info(f"Saved uploaded audio to temporary file: {audio_path}")
+
             # Load audio
+            logger.info(f"Loading audio from {audio_path}")
             audio, sr = torchaudio.load(audio_path)
             
             # Convert to mono if stereo
             if audio.shape[0] > 1:
+                logger.info(f"Converting {audio.shape[0]} channels to mono")
                 audio = torch.mean(audio, dim=0, keepdim=True)
             
             # Remove first dimension if it's 1
@@ -117,6 +141,7 @@ class VoiceCloner:
             
             # Resample if necessary
             if sr != self.sample_rate:
+                logger.info(f"Resampling from {sr}Hz to {self.sample_rate}Hz")
                 audio = torchaudio.functional.resample(
                     audio, orig_freq=sr, new_freq=self.sample_rate
                 )
@@ -125,6 +150,7 @@ class VoiceCloner:
             duration_seconds = len(audio) / self.sample_rate
             
             # Process audio for better quality
+            logger.info(f"Preprocessing audio for quality enhancement")
             processed_audio = self._preprocess_audio(audio)
             processed_duration = len(processed_audio) / self.sample_rate
             
@@ -133,24 +159,21 @@ class VoiceCloner:
                 f"processed duration={processed_duration:.2f}s"
             )
             
-            # Clean up temp file if we created one
-            if isinstance(file, (UploadFile, BinaryIO)) and os.path.exists(audio_path):
-                try:
-                    os.unlink(audio_path)
-                except Exception as e:
-                    logger.warning(f"Failed to delete temporary file {audio_path}: {e}")
-            
             return processed_audio, transcript, duration_seconds
-            
+                
         except Exception as e:
-            logger.error(f"Error processing audio: {e}")
-            if isinstance(file, (UploadFile, BinaryIO)) and os.path.exists(audio_path):
-                try:
-                    os.unlink(audio_path)
-                except:
-                    pass
+            logger.error(f"Error processing audio: {e}", exc_info=True)
             raise RuntimeError(f"Failed to process audio file: {e}")
-
+            
+        finally:
+            # Clean up temp file if we created one
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                    logger.debug(f"Deleted temporary file {temp_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete temporary file {temp_path}: {e}")
+                    
     def _preprocess_audio(self, audio: torch.Tensor) -> torch.Tensor:
         """
         Preprocess audio for better voice cloning quality.
@@ -284,6 +307,8 @@ class VoiceCloner:
         Returns:
             ClonedVoice object with voice information
         """
+        logger.info(f"Cloning new voice '{voice_name}' from audio file")
+        
         # Process the audio file
         processed_audio, provided_transcript, duration = await self.process_audio_file(
             audio_file, transcript
@@ -351,34 +376,53 @@ class VoiceCloner:
             logger.error(f"Audio file for voice {voice_id} not found at {audio_path}")
             return []
         
-        # Load the audio
-        audio, sr = torchaudio.load(audio_path)
-        audio = audio.squeeze(0)
-        
-        # Resample if necessary
-        if sr != self.sample_rate:
-            audio = torchaudio.functional.resample(
-                audio, orig_freq=sr, new_freq=self.sample_rate
+        try:
+            # Load the audio
+            audio, sr = torchaudio.load(audio_path)
+            audio = audio.squeeze(0)
+            
+            # Resample if necessary
+            if sr != self.sample_rate:
+                audio = torchaudio.functional.resample(
+                    audio, orig_freq=sr, new_freq=self.sample_rate
+                )
+            
+            # Trim to a maximum of 5 seconds to avoid sequence length issues
+            # This is a balance between voice quality and model limitations
+            max_samples = 5 * self.sample_rate  # 5 seconds
+            if audio.shape[0] > max_samples:
+                logger.info(f"Trimming voice sample from {audio.shape[0]} to {max_samples} samples")
+                # Take from beginning for better voice characteristics 
+                audio = audio[:max_samples]
+            
+            # Load transcript if available
+            transcript_path = os.path.join(voice_dir, "transcript.txt")
+            transcript = ""
+            if os.path.exists(transcript_path):
+                with open(transcript_path, "r") as f:
+                    full_transcript = f.read()
+                    # Take a portion of transcript that roughly matches our audio portion
+                    words = full_transcript.split()
+                    # Estimate 3 words per second as a rough average
+                    word_count = min(len(words), int(5 * 3))  # 5 seconds * 3 words/second
+                    transcript = " ".join(words[:word_count])
+            else:
+                transcript = f"Voice sample for {voice.name}"
+            
+            # Create context segment
+            segment = Segment(
+                text=transcript,
+                speaker=voice.speaker_id,
+                audio=audio.to(self.device)
             )
+            
+            logger.info(f"Created voice context segment with {audio.shape[0]/self.sample_rate:.1f}s audio")
+            return [segment]
+            
+        except Exception as e:
+            logger.error(f"Error getting voice context for {voice_id}: {e}")
+            return []
         
-        # Load transcript if available
-        transcript_path = os.path.join(voice_dir, "transcript.txt")
-        transcript = ""
-        if os.path.exists(transcript_path):
-            with open(transcript_path, "r") as f:
-                transcript = f.read()
-        else:
-            transcript = f"Voice sample for {voice.name}"
-        
-        # Create context segment
-        segment = Segment(
-            text=transcript,
-            speaker=voice.speaker_id,
-            audio=audio.to(self.device)
-        )
-        
-        return [segment]
-
     def list_voices(self) -> List[ClonedVoice]:
         """List all available cloned voices."""
         return list(self.cloned_voices.values())
@@ -441,19 +485,91 @@ class VoiceCloner:
         
         # Preprocess text for better pronunciation
         processed_text = self._preprocess_text(text)
+        logger.info(f"Generating speech with voice '{voice.name}' (ID: {voice_id})")
         
-        # Generate audio with the cloned voice
-        audio = self.generator.generate(
-            text=processed_text,
-            speaker=voice.speaker_id,
-            context=context,
-            max_audio_length_ms=max_audio_length_ms,
-            temperature=temperature,
-            topk=topk,
-        )
+        try:
+            # Check if text is too long and should be split
+            if len(processed_text) > 200:
+                logger.info(f"Text is long ({len(processed_text)} chars), splitting for better quality")
+                
+                from app.prompt_engineering import split_into_segments, format_text_for_voice
+                
+                # Split text into manageable segments
+                segments = split_into_segments(processed_text, max_chars=150)
+                logger.info(f"Split text into {len(segments)} segments")
+                
+                all_audio_chunks = []
+                
+                # Process each segment
+                for i, segment_text in enumerate(segments):
+                    logger.info(f"Generating segment {i+1}/{len(segments)}")
+                    
+                    # Format text with voice characteristics
+                    formatted_text = format_text_for_voice(
+                        segment_text, 
+                        "custom",  # Use generic formatting
+                        segment_index=i,
+                        total_segments=len(segments)
+                    )
+                    
+                    # Generate this segment
+                    segment_audio = self.generator.generate(
+                        text=formatted_text,
+                        speaker=voice.speaker_id,
+                        context=context,
+                        max_audio_length_ms=min(max_audio_length_ms, 10000),
+                        temperature=temperature,
+                        topk=topk,
+                    )
+                    
+                    all_audio_chunks.append(segment_audio)
+                    
+                    # Use this segment as context for the next one for consistency
+                    if i < len(segments) - 1:
+                        context = [
+                            Segment(
+                                text=segment_text,
+                                speaker=voice.speaker_id,
+                                audio=segment_audio
+                            )
+                        ]
+                
+                # Combine chunks with small silence between them
+                if len(all_audio_chunks) == 1:
+                    audio = all_audio_chunks[0]
+                else:
+                    silence_samples = int(0.1 * self.sample_rate)  # 100ms silence
+                    silence = torch.zeros(silence_samples, device=all_audio_chunks[0].device)
+                    
+                    # Join segments with silence
+                    audio_parts = []
+                    for i, chunk in enumerate(all_audio_chunks):
+                        audio_parts.append(chunk)
+                        if i < len(all_audio_chunks) - 1:  # Don't add silence after the last chunk
+                            audio_parts.append(silence)
+                            
+                    # Concatenate all parts
+                    audio = torch.cat(audio_parts)
+                    
+                return audio
+                
+            else:
+                # For short text, generate directly
+                audio = self.generator.generate(
+                    text=processed_text,
+                    speaker=voice.speaker_id,
+                    context=context,
+                    max_audio_length_ms=max_audio_length_ms,
+                    temperature=temperature,
+                    topk=topk,
+                )
+                
+                return audio
+                
+        except Exception as e:
+            logger.error(f"Error generating speech with voice {voice_id}: {e}")
+            raise
         
-        return audio
-
     def _preprocess_text(self, text: str) -> str:
         """Preprocess text for better pronunciation and voice cloning."""
         # Make sure text ends with punctuation for better phrasing

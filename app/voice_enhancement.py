@@ -208,16 +208,24 @@ def apply_anti_muffling(audio: torch.Tensor, sample_rate: int, clarity_boost: fl
     # Convert to numpy for filtering
     audio_np = audio.detach().cpu().numpy()
     
-    # Design a high-shelf filter to boost high frequencies
-    # These parameters are tuned to enhance speech clarity
-    b, a = signal.butter(2, 2000/(sample_rate/2), btype='highshelf', analog=False)
-    
-    # Apply the filter with the clarity boost gain
-    boosted = signal.filtfilt(b, a, audio_np, axis=0) * clarity_boost
-    
-    # Mix with original to maintain some warmth
-    mix_ratio = 0.7  # 70% processed, 30% original
-    processed = mix_ratio * boosted + (1-mix_ratio) * audio_np
+    try:
+        # Design a high shelf filter to boost high frequencies
+        # Use a standard high-shelf filter that's supported by scipy.signal
+        # We'll use a second-order Butterworth high-pass filter as an alternative
+        cutoff = 2000  # Hz
+        b, a = signal.butter(2, cutoff/(sample_rate/2), btype='high', analog=False)
+        
+        # Apply the filter with the clarity boost gain
+        boosted = signal.filtfilt(b, a, audio_np, axis=0) * clarity_boost
+        
+        # Mix with original to maintain some warmth
+        mix_ratio = 0.7  # 70% processed, 30% original
+        processed = mix_ratio * boosted + (1-mix_ratio) * audio_np
+        
+    except Exception as e:
+        logger.warning(f"Audio enhancement failed, using original: {e}")
+        # Return original audio if enhancement fails
+        return audio
     
     # Convert back to tensor on original device
     return torch.tensor(processed, dtype=audio.dtype, device=audio.device)
