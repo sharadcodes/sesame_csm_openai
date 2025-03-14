@@ -173,7 +173,7 @@ class VoiceCloner:
                     logger.debug(f"Deleted temporary file {temp_path}")
                 except Exception as e:
                     logger.warning(f"Failed to delete temporary file {temp_path}: {e}")
-                    
+
     def _preprocess_audio(self, audio: torch.Tensor) -> torch.Tensor:
         """
         Preprocess audio for better voice cloning quality.
@@ -189,10 +189,31 @@ class VoiceCloner:
             audio = audio / torch.max(torch.abs(audio))
         
         # Remove silence with dynamic threshold
-        audio = self._remove_silence(audio)
+        audio = self._remove_silence(audio, threshold=0.02)  # Slightly higher threshold to remove more noise
         
-        # Apply additional preprocessing
-        audio = self._enhance_speech(audio)
+        # Remove DC offset (very low frequency noise)
+        audio = audio - torch.mean(audio)
+        
+        # Apply simple noise reduction
+        # This filters out very high frequencies that might contain noise
+        try:
+            audio_np = audio.cpu().numpy()
+            from scipy import signal
+            
+            # Apply a bandpass filter to focus on speech frequencies (80Hz - 8000Hz)
+            sos = signal.butter(3, [80, 8000], 'bandpass', fs=self.sample_rate, output='sos')
+            filtered = signal.sosfilt(sos, audio_np)
+            
+            # Normalize the filtered audio
+            filtered = filtered / (np.max(np.abs(filtered)) + 1e-8)
+            
+            # Convert back to torch tensor
+            audio = torch.tensor(filtered, device=audio.device)
+        except Exception as e:
+            logger.warning(f"Advanced audio filtering failed, using basic processing: {e}")
+        
+        # Ensure audio has correct amplitude
+        audio = audio * 0.9  # Slightly reduce volume to prevent clipping
         
         return audio
 
@@ -292,7 +313,7 @@ class VoiceCloner:
         voice_name: str,
         transcript: Optional[str] = None,
         description: Optional[str] = None,
-        speaker_id: int = 999  # Use a high ID to avoid conflicts
+        speaker_id: Optional[int] = None  # Make this optional
     ) -> ClonedVoice:
         """
         Clone a voice from an audio file.
@@ -302,7 +323,7 @@ class VoiceCloner:
             voice_name: Name for the cloned voice
             transcript: Transcript of the audio (optional)
             description: Description of the voice (optional)
-            speaker_id: Speaker ID to use (default: 999)
+            speaker_id: Speaker ID to use (default: auto-assigned)
             
         Returns:
             ClonedVoice object with voice information
@@ -313,6 +334,20 @@ class VoiceCloner:
         processed_audio, provided_transcript, duration = await self.process_audio_file(
             audio_file, transcript
         )
+        
+        # Use a better speaker ID assignment - use a small number similar to the built-in voices
+        # This prevents issues with the speaker ID being interpreted as speech
+        if speaker_id is None:
+            # Use a number between 10-20 to avoid conflicts with built-in voices (0-5)
+            # but not too large like 999 which might cause issues
+            existing_ids = [v.speaker_id for v in self.cloned_voices.values()]
+            for potential_id in range(10, 20):
+                if potential_id not in existing_ids:
+                    speaker_id = potential_id
+                    break
+            else:
+                # If all IDs in range are taken, use a fallback
+                speaker_id = 10
         
         # Generate a unique ID for the voice
         voice_id = f"{int(time.time())}_{voice_name.lower().replace(' ', '_')}"
@@ -350,7 +385,7 @@ class VoiceCloner:
         # Add to cloned voices dictionary
         self.cloned_voices[voice_id] = voice_info
         
-        logger.info(f"Voice '{voice_name}' cloned successfully with ID: {voice_id}")
+        logger.info(f"Voice '{voice_name}' cloned successfully with ID: {voice_id} and speaker_id: {speaker_id}")
         
         return voice_info
 
@@ -485,7 +520,7 @@ class VoiceCloner:
         
         # Preprocess text for better pronunciation
         processed_text = self._preprocess_text(text)
-        logger.info(f"Generating speech with voice '{voice.name}' (ID: {voice_id})")
+        logger.info(f"Generating speech with voice '{voice.name}' (ID: {voice_id}, speaker: {voice.speaker_id})")
         
         try:
             # Check if text is too long and should be split
@@ -504,10 +539,10 @@ class VoiceCloner:
                 for i, segment_text in enumerate(segments):
                     logger.info(f"Generating segment {i+1}/{len(segments)}")
                     
-                    # Format text with voice characteristics
+                    # Format text for cloned voice
                     formatted_text = format_text_for_voice(
                         segment_text, 
-                        "custom",  # Use generic formatting
+                        "custom",  # Use custom formatting for cloned voices
                         segment_index=i,
                         total_segments=len(segments)
                     )
@@ -555,8 +590,17 @@ class VoiceCloner:
                 
             else:
                 # For short text, generate directly
+                # Format text for cloned voice
+                from app.prompt_engineering import format_text_for_voice
+                formatted_text = format_text_for_voice(
+                    processed_text, 
+                    "custom",
+                    segment_index=0,
+                    total_segments=1
+                )
+                
                 audio = self.generator.generate(
-                    text=processed_text,
+                    text=formatted_text,
                     speaker=voice.speaker_id,
                     context=context,
                     max_audio_length_ms=max_audio_length_ms,
@@ -569,7 +613,7 @@ class VoiceCloner:
         except Exception as e:
             logger.error(f"Error generating speech with voice {voice_id}: {e}")
             raise
-        
+            
     def _preprocess_text(self, text: str) -> str:
         """Preprocess text for better pronunciation and voice cloning."""
         # Make sure text ends with punctuation for better phrasing
