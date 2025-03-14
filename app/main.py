@@ -88,6 +88,7 @@ async def startup_event():
     os.makedirs("models", exist_ok=True)
     os.makedirs("tokenizers", exist_ok=True)
     os.makedirs("voice_memories", exist_ok=True)
+    os.makedirs("voice_references", exist_ok=True)
     
     # Set tokenizer cache
     try:
@@ -96,12 +97,26 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Error setting tokenizer cache: {e}")
     
+    # Install additional dependencies if needed
+    try:
+        import scipy
+        import soundfile
+        logger.info("Audio processing dependencies available")
+    except ImportError as e:
+        logger.warning(f"Audio processing dependency missing: {e}. Some audio enhancements may not work.")
+        logger.warning("Consider installing: pip install scipy soundfile")
+    
     # Check CUDA availability
     cuda_available = torch.cuda.is_available()
     if cuda_available:
         device_count = torch.cuda.device_count()
         device_name = torch.cuda.get_device_name(0) if device_count > 0 else "unknown"
         logger.info(f"CUDA is available: {device_count} device(s). Using {device_name}")
+        
+        # Report CUDA memory
+        if hasattr(torch.cuda, 'get_device_properties'):
+            total_memory = torch.cuda.get_device_properties(0).total_memory
+            logger.info(f"Total CUDA memory: {total_memory / (1024**3):.2f} GB")
     else:
         logger.warning("CUDA is not available. Using CPU (this will be slow)")
     
@@ -159,22 +174,38 @@ async def startup_event():
         app.state.sample_rate = app.state.generator.sample_rate
         logger.info(f"Model sample rate: {app.state.sample_rate} Hz")
         
-        # Initialize voice memories
-        logger.info("Initializing voice memories...")
-        from app.voice_memory import initialize_voices
-        initialize_voices(sample_rate=app.state.sample_rate)
-        logger.info("Voice memories initialized")
+        # Initialize voice enhancement system (this will create proper voice profiles)
+        logger.info("Initializing voice enhancement system...")
+        try:
+            from app.voice_enhancement import initialize_voice_profiles
+            initialize_voice_profiles()
+            logger.info("Voice profiles initialized successfully")
+        except Exception as e:
+            error_stack = traceback.format_exc()
+            logger.error(f"Error initializing voice profiles: {str(e)}\n{error_stack}")
+            logger.warning("Voice enhancement features will be limited")
         
-        # Generate voice samples (runs in background to avoid blocking startup)
+        # Create prompt templates for consistent generation
+        logger.info("Setting up prompt engineering templates...")
+        try:
+            from app.prompt_engineering import initialize_templates
+            initialize_templates()
+            logger.info("Prompt templates initialized")
+        except Exception as e:
+            error_stack = traceback.format_exc()
+            logger.error(f"Error initializing prompt templates: {str(e)}\n{error_stack}")
+            logger.warning("Voice consistency features will be limited")
+        
+        # Generate voice reference samples (runs in background to avoid blocking startup)
         async def generate_samples_async():
             try:
-                logger.info("Starting voice sample generation (background task)...")
-                from app.voice_memory import generate_voice_samples
-                generate_voice_samples(app.state)
-                logger.info("Voice sample generation completed")
+                logger.info("Starting voice reference generation (background task)...")
+                from app.voice_enhancement import create_voice_segments
+                create_voice_segments(app.state)
+                logger.info("Voice reference generation completed")
             except Exception as e:
                 error_stack = traceback.format_exc()
-                logger.error(f"Error in voice sample generation: {str(e)}\n{error_stack}")
+                logger.error(f"Error in voice reference generation: {str(e)}\n{error_stack}")
         
         # Start as a background task
         asyncio.create_task(generate_samples_async())
@@ -189,7 +220,8 @@ async def startup_event():
             "name": "CSM-1B",
             "device": device,
             "sample_rate": app.state.sample_rate,
-            "voices": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+            "voices": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
+            "enhancements_enabled": True
         }
         
         logger.info(f"CSM-1B TTS API is ready on {device} with sample rate {app.state.sample_rate}")
@@ -219,6 +251,15 @@ async def shutdown_event():
         except Exception as e:
             logger.error(f"Error during CUDA cleanup: {e}")
     
+    # Save voice profiles if they've been updated
+    try:
+        from app.voice_enhancement import save_voice_profiles
+        logger.info("Saving voice profiles...")
+        save_voice_profiles()
+        logger.info("Voice profiles saved successfully")
+    except Exception as e:
+        logger.error(f"Error saving voice profiles: {e}")
+    
     logger.info("Application shutdown complete")
 
 # Health check endpoint
@@ -228,13 +269,32 @@ async def health_check():
     model_status = "healthy" if hasattr(app.state, "generator") and app.state.generator is not None else "unhealthy"
     uptime = time.time() - getattr(app.state, "startup_time", time.time())
     
+    # Get enhanced voices info
+    voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+    try:
+        from app.voice_enhancement import VOICE_PROFILES
+        voices = list(VOICE_PROFILES.keys())
+    except Exception:
+        pass
+    
+    # Get CUDA memory stats if available
+    cuda_stats = None
+    if torch.cuda.is_available():
+        cuda_stats = {
+            "allocated_gb": torch.cuda.memory_allocated() / (1024**3),
+            "reserved_gb": torch.cuda.memory_reserved() / (1024**3)
+        }
+    
     return {
         "status": model_status,
         "uptime": f"{uptime:.2f} seconds",
         "device": getattr(app.state, "device", "unknown"),
         "model": "CSM-1B",
-        "voices": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
+        "voices": voices,
         "sample_rate": getattr(app.state, "sample_rate", 0),
+        "enhancements": "enabled" if hasattr(app.state, "model_info") and 
+                        app.state.model_info.get("enhancements_enabled", False) else "disabled",
+        "cuda": cuda_stats,
         "version": "1.0.0"
     }
 
@@ -245,7 +305,8 @@ async def version():
     return {
         "api_version": "1.0.0",
         "model_version": "CSM-1B",
-        "compatible_with": "OpenAI TTS v1"
+        "compatible_with": "OpenAI TTS v1",
+        "enhancements": "voice consistency and audio quality v1.0"
     }
 
 @app.get("/", include_in_schema=False)
@@ -264,6 +325,14 @@ if __name__ == "__main__":
     # Log level (default to INFO, but can be overridden)
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.getLogger().setLevel(log_level)
+    
+    # Check for audio enhancement flags
+    enable_enhancements = os.environ.get("ENABLE_ENHANCEMENTS", "true").lower() == "true"
+    if not enable_enhancements:
+        logger.warning("Voice enhancements disabled by environment variable")
+    
+    logger.info(f"Voice enhancements: {'enabled' if enable_enhancements else 'disabled'}")
+    logger.info(f"Log level: {log_level}")
     
     if dev_mode:
         logger.info(f"Running in development mode with auto-reload enabled on port {port}")

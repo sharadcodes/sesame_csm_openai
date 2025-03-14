@@ -15,3 +15,6 @@ torchtune>=0.5.0
 numpy>=1.25.0
 ffmpeg-python>=0.2.0
 moshi>=0.1.0
+soundfile>=0.12.1
+scipy>=1.10.0
+librosa>=0.10.0

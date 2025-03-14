@@ -1,7 +1,9 @@
 import os
 import io
+import base64
 import time
 import tempfile
+import logging
 from typing import Dict, List, Optional, Any, Union
 
 import torch
@@ -12,8 +14,9 @@ from fastapi.responses import StreamingResponse
 
 from app.api.schemas import TTSRequest, ResponseFormat, Voice
 from app.models import Segment
-from app.voice_memory import get_voice_context, update_voice_memory
-from app.voice_embeddings import initialize_voices, get_voice_sample, update_voice_sample
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -42,7 +45,7 @@ async def text_to_speech(
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     # Log the request body to debug
-    print(f"Received request body: {body}")
+    logger.info(f"Received TTS request: {body}")
     
     # Extract parameters with fallbacks
     text = body.get("input", "")
@@ -72,17 +75,17 @@ async def text_to_speech(
             }
             speaker = voice_map[voice_name]
         else:
-            # Check if it's a custom voice in voice memories
-            from app.voice_memory import VOICE_MEMORIES
-            if voice_name in VOICE_MEMORIES:
-                speaker = VOICE_MEMORIES[voice_name].speaker_id
+            # Check if it's a custom voice in voice profiles
+            from app.voice_enhancement import VOICE_PROFILES
+            if voice_name in VOICE_PROFILES:
+                speaker = VOICE_PROFILES[voice_name].speaker_id
             else:
                 # Default to speaker 0
-                print(f"Unknown voice '{voice_name}', defaulting to speaker 0")
+                logger.warning(f"Unknown voice '{voice_name}', defaulting to speaker 0")
                 speaker = 0
                 voice_name = "alloy"
     except Exception as e:
-        print(f"Error processing voice parameter: {e}")
+        logger.error(f"Error processing voice parameter: {e}")
         speaker = 0
         voice_name = "alloy"
     
@@ -92,49 +95,101 @@ async def text_to_speech(
     max_audio_length_ms = float(body.get("max_audio_length_ms", 90000))
     
     # Voice consistency parameters
-    voice_consistency = float(body.get("voice_consistency", 0.8))  # How strongly to maintain voice characteristics
+    voice_consistency = float(body.get("voice_consistency", 0.9))  # Higher consistency by default
     max_context_segments = int(body.get("max_context_segments", 2))  # Number of context segments to use
-    prioritize_voice_consistency = body.get("prioritize_voice_consistency", False)
+    prioritize_consistency = body.get("prioritize_consistency", True)
     
     # Adjust temperature based on voice consistency priority
-    temperature = float(body.get("temperature", 0.9))
-    if prioritize_voice_consistency:
-        temperature = min(temperature, 0.7)  # Lower temperature for more consistent voice
+    temperature = float(body.get("temperature", 0.8))  # Lower default for more consistency
+    if prioritize_consistency:
+        temperature = min(temperature, 0.7)  # Ensure lower temperature for focused generation
     
-    topk = int(body.get("topk", 50))
+    topk = int(body.get("topk", 40))
     
     # Generate audio
     try:
-        print(f"Generating audio for: '{text}' with voice={voice_name} (speaker={speaker})")
+        logger.info(f"Generating audio for: '{text[:100]}...' with voice={voice_name} (speaker={speaker})")
         
-        # Get context segments for this voice - using the enhanced voice memory system
-        from app.voice_memory import get_voice_context, update_voice_memory
+        # Import advanced text and voice processing 
+        from app.prompt_engineering import split_into_segments, format_text_for_voice
+        from app.voice_enhancement import get_voice_segments, process_generated_audio
         
-        context = get_voice_context(voice_name, generator.device, max_segments=max_context_segments)
+        # Get context segments for this voice
+        context = get_voice_segments(voice_name, generator.device)
         if context:
-            print(f"Using {len(context)} context segments for voice consistency")
+            logger.info(f"Using {len(context)} reference segments for voice consistency")
+        
+        # Check if text needs to be split into segments
+        # Splitting helps generate more consistent and complete audio
+        segments = split_into_segments(text, max_chars=200)
+        logger.info(f"Split text into {len(segments)} segments for processing")
+        
+        # Process each segment with voice consistency
+        all_audio_chunks = []
+        
+        for i, segment_text in enumerate(segments):
+            # Format text with voice characteristics for consistency
+            formatted_text = format_text_for_voice(
+                segment_text, 
+                voice_name,
+                segment_index=i,
+                total_segments=len(segments)
+            )
             
-            # Adjust context influence based on voice_consistency parameter
-            # Higher value = stronger influence of previous voice samples
-            if voice_consistency > 0:
-                for segment in context:
-                    # Scale the audio to increase/decrease its influence on the generation
-                    segment.audio = segment.audio * voice_consistency
+            logger.info(f"Generating segment {i+1}/{len(segments)}: '{formatted_text[:50]}...'")
+            
+            # Generate audio for this segment
+            audio_segment = generator.generate(
+                text=formatted_text,
+                speaker=speaker,
+                context=context,
+                max_audio_length_ms=min(max_audio_length_ms, 15000),  # Shorter segments for better control
+                temperature=temperature,
+                topk=topk,
+            )
+            
+            # Process audio for quality and consistency
+            processed_segment = process_generated_audio(
+                audio_segment,
+                voice_name,
+                generator.sample_rate,
+                segment_text
+            )
+            
+            # Add to overall audio
+            all_audio_chunks.append(processed_segment)
+            
+            # Update context for next segment to maintain consistency
+            if len(all_audio_chunks) > 0 and voice_consistency > 0.5:
+                # Use the current segment as context for the next segment
+                # This maintains voice consistency across segments
+                context = [
+                    Segment(
+                        speaker=speaker,
+                        text=segment_text,
+                        audio=processed_segment.to(generator.device)
+                    )
+                ] + context[:max_context_segments-1]  # Keep limited context
         
-        # Generate audio
-        audio = generator.generate(
-            text=text,
-            speaker=speaker,
-            context=context,
-            max_audio_length_ms=max_audio_length_ms,
-            temperature=temperature,
-            topk=topk,
-        )
-        
-        # Update voice memory with the newly generated audio
-        # Only update if the generation seemed successful (audio not too short or empty)
-        if audio is not None and audio.shape[0] > 1000:  # Minimum audio length check
-            update_voice_memory(voice_name, audio, text)
+        # Combine audio chunks
+        if len(all_audio_chunks) == 1:
+            audio = all_audio_chunks[0]
+        else:
+            # Add small silence between segments for natural pauses
+            silence_samples = int(0.1 * generator.sample_rate)  # 100ms silence
+            silence = torch.zeros(silence_samples, device=all_audio_chunks[0].device)
+            
+            # Join segments with silence
+            audio_parts = []
+            for i, chunk in enumerate(all_audio_chunks):
+                audio_parts.append(chunk)
+                if i < len(all_audio_chunks) - 1:  # Don't add silence after the last chunk
+                    audio_parts.append(silence)
+                    
+            # Concatenate all parts
+            audio = torch.cat(audio_parts)
+            
+            logger.info(f"Combined {len(all_audio_chunks)} audio chunks, total duration: {audio.shape[0]/generator.sample_rate:.2f}s")
         
         # Apply speed adjustment if needed (using resample)
         if speed != 1.0:
@@ -151,6 +206,8 @@ async def text_to_speech(
                 orig_freq=new_sample_rate, 
                 new_freq=generator.sample_rate
             )
+            
+            logger.info(f"Applied speed adjustment: {speed}x")
         
         # Create temporary file for audio conversion
         with tempfile.NamedTemporaryFile(suffix=f".{response_format}", delete=False) as temp_file:
@@ -212,8 +269,8 @@ async def text_to_speech(
         
     except Exception as e:
         import traceback
-        print(f"Speech generation failed: {str(e)}")
-        print(traceback.format_exc())
+        error_trace = traceback.format_exc()
+        logger.error(f"Speech generation failed: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Speech generation failed: {str(e)}")
 
 @router.post("/audio/voices/create", summary="Create a new voice")
@@ -226,7 +283,7 @@ async def create_voice(
     timbre: str = Body("custom", description="Voice quality descriptor")
 ):
     """Create a new custom voice."""
-    from app.voice_memory import create_custom_voice
+    from app.voice_enhancement import create_custom_voice
     
     result = create_custom_voice(
         app_state=request.app.state,
@@ -298,13 +355,36 @@ async def conversation_to_speech(
                     audio=audio_tensor
                 )
             )
+            
+        logger.info(f"Conversation request: '{text}' with {len(segments)} context segments")
+        
+        # Format the text for better voice consistency
+        from app.prompt_engineering import format_text_for_voice
+        
+        # Determine voice name from speaker_id
+        voice_names = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+        voice_name = voice_names[speaker_id] if 0 <= speaker_id < len(voice_names) else "alloy"
+        
+        formatted_text = format_text_for_voice(text, voice_name)
         
         # Generate audio with context
         audio = generator.generate(
-            text=text,
+            text=formatted_text,
             speaker=speaker_id,
             context=segments,
-            max_audio_length_ms=10000,  # 10 seconds
+            max_audio_length_ms=20000,  # 20 seconds
+            temperature=0.7,  # Lower temperature for more stable output
+            topk=40,
+        )
+        
+        # Process audio for better quality
+        from app.voice_enhancement import process_generated_audio
+        
+        processed_audio = process_generated_audio(
+            audio, 
+            voice_name,
+            generator.sample_rate,
+            text
         )
         
         # Save to temporary file
@@ -312,7 +392,7 @@ async def conversation_to_speech(
             temp_path = temp.name
         
         # Save audio
-        torchaudio.save(temp_path, audio.unsqueeze(0).cpu(), generator.sample_rate)
+        torchaudio.save(temp_path, processed_audio.unsqueeze(0).cpu(), generator.sample_rate)
         
         # Return audio file
         def iterfile():
@@ -322,6 +402,8 @@ async def conversation_to_speech(
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
         
+        logger.info(f"Generated conversation response, duration: {processed_audio.shape[0]/generator.sample_rate:.2f}s")
+        
         return StreamingResponse(
             iterfile(),
             media_type="audio/wav",
@@ -329,6 +411,9 @@ async def conversation_to_speech(
         )
     
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"Conversation speech generation failed: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Conversation speech generation failed: {str(e)}")
 
 # Add OpenAI-compatible voice list endpoint
@@ -337,50 +422,80 @@ async def list_voices():
     """
     OpenAI compatible endpoint that returns a list of available voices.
     """
-    voices = [
-        {
-            "voice_id": "alloy",
-            "name": "Alloy",
-            "preview_url": None,
-            "description": "CSM Speaker 0",
-            "languages": [{"language_code": "en", "name": "English"}]
-        },
-        {
-            "voice_id": "echo",
-            "name": "Echo",
-            "preview_url": None,
-            "description": "CSM Speaker 1",
-            "languages": [{"language_code": "en", "name": "English"}]
-        },
-        {
-            "voice_id": "fable",
-            "name": "Fable",
-            "preview_url": None,
-            "description": "CSM Speaker 2",
-            "languages": [{"language_code": "en", "name": "English"}]
-        },
-        {
-            "voice_id": "onyx",
-            "name": "Onyx",
-            "preview_url": None,
-            "description": "CSM Speaker 3",
-            "languages": [{"language_code": "en", "name": "English"}]
-        },
-        {
-            "voice_id": "nova",
-            "name": "Nova",
-            "preview_url": None,
-            "description": "CSM Speaker 4",
-            "languages": [{"language_code": "en", "name": "English"}]
-        },
-        {
-            "voice_id": "shimmer",
-            "name": "Shimmer",
-            "preview_url": None,
-            "description": "CSM Speaker 5",
-            "languages": [{"language_code": "en", "name": "English"}]
-        }
-    ]
+    # Get voice descriptions from profiles if available
+    try:
+        from app.voice_enhancement import VOICE_PROFILES
+        voices = [
+            {
+                "voice_id": name,
+                "name": name.capitalize(),
+                "preview_url": None,
+                "description": f"{profile.timbre.capitalize()} voice with {int(profile.pitch_range[0])}-{int(profile.pitch_range[1])}Hz range",
+                "languages": [{"language_code": "en", "name": "English"}]
+            }
+            for name, profile in VOICE_PROFILES.items()
+        ]
+    except ImportError:
+        # Fallback to basic voice descriptions
+        voices = [
+            {
+                "voice_id": "alloy",
+                "name": "Alloy",
+                "preview_url": None,
+                "description": "Balanced voice with natural tone",
+                "languages": [{"language_code": "en", "name": "English"}]
+            },
+            {
+                "voice_id": "echo",
+                "name": "Echo",
+                "preview_url": None,
+                "description": "Resonant voice with deeper qualities",
+                "languages": [{"language_code": "en", "name": "English"}]
+            },
+            {
+                "voice_id": "fable",
+                "name": "Fable",
+                "preview_url": None,
+                "description": "Brighter voice with higher pitch",
+                "languages": [{"language_code": "en", "name": "English"}]
+            },
+            {
+                "voice_id": "onyx",
+                "name": "Onyx",
+                "preview_url": None,
+                "description": "Deep, authoritative voice",
+                "languages": [{"language_code": "en", "name": "English"}]
+            },
+            {
+                "voice_id": "nova",
+                "name": "Nova",
+                "preview_url": None,
+                "description": "Warm, pleasant voice with medium range",
+                "languages": [{"language_code": "en", "name": "English"}]
+            },
+            {
+                "voice_id": "shimmer",
+                "name": "Shimmer",
+                "preview_url": None,
+                "description": "Light, airy voice with higher frequencies",
+                "languages": [{"language_code": "en", "name": "English"}]
+            }
+        ]
+    
+    # Check for custom voices
+    try:
+        from app.voice_enhancement import get_custom_voices
+        custom_voices = get_custom_voices()
+        for voice in custom_voices:
+            voices.append({
+                "voice_id": voice["name"],
+                "name": voice["name"].capitalize(),
+                "preview_url": None,
+                "description": f"Custom voice based on {voice['base_voice']}",
+                "languages": [{"language_code": "en", "name": "English"}]
+            })
+    except (ImportError, AttributeError):
+        pass
     
     return {"voices": voices}
 
@@ -463,6 +578,7 @@ async def debug_info(request: Request):
     """Get debug information about the API."""
     generator = request.app.state.generator
     
+    # Basic info
     debug_info = {
         "model_loaded": generator is not None,
         "device": generator.device if generator is not None else None,
@@ -471,45 +587,165 @@ async def debug_info(request: Request):
         "response_formats": [f.value for f in ResponseFormat],
     }
     
+    # Add voice enhancement info if available
+    try:
+        from app.voice_enhancement import VOICE_PROFILES
+        voice_info = {}
+        for name, profile in VOICE_PROFILES.items():
+            voice_info[name] = {
+                "pitch_range": f"{profile.pitch_range[0]}-{profile.pitch_range[1]}Hz",
+                "timbre": profile.timbre,
+                "ref_segments": len(profile.reference_segments),
+            }
+        debug_info["voice_profiles"] = voice_info
+    except ImportError:
+        debug_info["voice_profiles"] = "Not available"
+    
+    # Add memory usage info for CUDA
+    if torch.cuda.is_available():
+        debug_info["cuda"] = {
+            "allocated_memory_gb": torch.cuda.memory_allocated() / 1e9,
+            "reserved_memory_gb": torch.cuda.memory_reserved() / 1e9,
+            "max_memory_gb": torch.cuda.get_device_properties(0).total_memory / 1e9,
+        }
+    
     return debug_info
+
+# Voice diagnostics endpoint
+@router.get("/debug/voices", summary="Voice diagnostics")
+async def voice_diagnostics():
+    """Get diagnostic information about voice references."""
+    try:
+        from app.voice_enhancement import VOICE_PROFILES
+        
+        diagnostics = {}
+        for name, profile in VOICE_PROFILES.items():
+            ref_info = []
+            for i, ref in enumerate(profile.reference_segments):
+                if ref is not None:
+                    duration = ref.shape[0] / 24000  # Assume 24kHz
+                    ref_info.append({
+                        "index": i,
+                        "duration_seconds": f"{duration:.2f}",
+                        "samples": ref.shape[0],
+                        "min": float(ref.min()),
+                        "max": float(ref.max()),
+                        "rms": float(torch.sqrt(torch.mean(ref ** 2))),
+                    })
+            
+            diagnostics[name] = {
+                "speaker_id": profile.speaker_id,
+                "pitch_range": f"{profile.pitch_range[0]}-{profile.pitch_range[1]}Hz",
+                "references": ref_info,
+                "reference_count": len(ref_info),
+            }
+        
+        return {"diagnostics": diagnostics}
+    except ImportError:
+        return {"error": "Voice enhancement module not available"}
 
 # Specialized debugging endpoint for speech generation
 @router.post("/debug/speech", summary="Debug speech generation")
 async def debug_speech(
     request: Request,
     text: str = Body(..., embed=True),
-    speaker: int = Body(0, embed=True)
+    voice: str = Body("alloy", embed=True),
+    use_enhancement: bool = Body(True, embed=True)
 ):
-    """Debug endpoint for speech generation."""
+    """Debug endpoint for speech generation with enhancement options."""
     generator = request.app.state.generator
     
     if generator is None:
         return {"error": "Model not loaded"}
     
     try:
+        # Convert voice name to speaker ID
+        voice_map = {
+            "alloy": 0, 
+            "echo": 1, 
+            "fable": 2, 
+            "onyx": 3, 
+            "nova": 4, 
+            "shimmer": 5
+        }
+        speaker = voice_map.get(voice, 0)
+        
+        # Format text if using enhancement
+        if use_enhancement:
+            from app.prompt_engineering import format_text_for_voice
+            formatted_text = format_text_for_voice(text, voice)
+            logger.info(f"Using formatted text: {formatted_text}")
+        else:
+            formatted_text = text
+            
+        # Get context if using enhancement
+        if use_enhancement:
+            from app.voice_enhancement import get_voice_segments
+            context = get_voice_segments(voice, generator.device)
+            logger.info(f"Using {len(context)} context segments")
+        else:
+            context = []
+            
         # Generate audio
+        start_time = time.time()
         audio = generator.generate(
-            text=text,
+            text=formatted_text,
             speaker=speaker,
-            context=[],
-            max_audio_length_ms=10000,  # Short for testing
-            temperature=0.9,
-            topk=50,
+            context=context,
+            max_audio_length_ms=10000,  # 10 seconds
+            temperature=0.7 if use_enhancement else 0.9,
+            topk=40 if use_enhancement else 50,
         )
+        generation_time = time.time() - start_time
+        
+        # Process audio if using enhancement
+        if use_enhancement:
+            from app.voice_enhancement import process_generated_audio
+            start_time = time.time()
+            processed_audio = process_generated_audio(audio, voice, generator.sample_rate, text)
+            processing_time = time.time() - start_time
+        else:
+            processed_audio = audio
+            processing_time = 0
         
         # Save to temporary WAV file
-        temp_path = f"/tmp/debug_speech_{int(time.time())}.wav"
-        torchaudio.save(temp_path, audio.unsqueeze(0).cpu(), generator.sample_rate)
+        temp_path = f"/tmp/debug_speech_{voice}_{int(time.time())}.wav"
+        torchaudio.save(temp_path, processed_audio.unsqueeze(0).cpu(), generator.sample_rate)
+        
+        # Also save original if enhanced
+        if use_enhancement:
+            orig_path = f"/tmp/debug_speech_{voice}_original_{int(time.time())}.wav"
+            torchaudio.save(orig_path, audio.unsqueeze(0).cpu(), generator.sample_rate)
+        else:
+            orig_path = temp_path
+            
+        # Calculate audio metrics
+        duration = processed_audio.shape[0] / generator.sample_rate
+        rms = float(torch.sqrt(torch.mean(processed_audio ** 2)))
+        peak = float(processed_audio.abs().max())
         
         return {
             "status": "success",
             "message": f"Audio generated successfully and saved to {temp_path}",
-            "audio_shape": list(audio.shape),
-            "sample_rate": generator.sample_rate
+            "audio": {
+                "duration_seconds": f"{duration:.2f}",
+                "samples": processed_audio.shape[0],
+                "sample_rate": generator.sample_rate,
+                "rms_level": f"{rms:.3f}",
+                "peak_level": f"{peak:.3f}",
+            },
+            "processing": {
+                "enhancement_used": use_enhancement,
+                "generation_time_seconds": f"{generation_time:.3f}",
+                "processing_time_seconds": f"{processing_time:.3f}",
+                "original_path": orig_path,
+                "processed_path": temp_path,
+            }
         }
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
+        logger.error(f"Debug speech generation failed: {e}\n{error_trace}")
         return {
             "status": "error",
             "message": str(e),
