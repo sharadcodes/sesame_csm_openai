@@ -67,6 +67,7 @@ async def text_to_speech(
             # Already a numeric string
             speaker = int(voice_name)
             voice_name = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"][speaker]
+            cloned_voice_id = None
         elif voice_name in ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]:
             # Convert named voice to speaker ID
             voice_map = {
@@ -78,6 +79,7 @@ async def text_to_speech(
                 "shimmer": 5
             }
             speaker = voice_map[voice_name]
+            cloned_voice_id = None
         else:
             # Check if this is a cloned voice
             cloned_voice_id = None
@@ -106,6 +108,7 @@ async def text_to_speech(
         logger.error(f"Error processing voice parameter: {e}")
         speaker = 0
         voice_name = "alloy"
+        cloned_voice_id = None
     
     # Handle other parameters
     response_format = body.get("response_format", "mp3")
@@ -152,16 +155,24 @@ async def text_to_speech(
         # Process each segment with voice consistency
         all_audio_chunks = []
         
+        # Determine if this is a cloned voice or a built-in voice
+        is_cloned_voice = cloned_voice_id is not None
+        
         for i, segment_text in enumerate(segments):
-            # Format text with voice characteristics for consistency
-            formatted_text = format_text_for_voice(
-                segment_text, 
-                voice_name,
-                segment_index=i,
-                total_segments=len(segments)
-            )
+            # Format text appropriately based on voice type
+            if is_cloned_voice:
+                # For cloned voices, use plain text without formatting
+                formatted_text = segment_text
+            else:
+                # For built-in voices, apply style formatting
+                formatted_text = format_text_for_voice(
+                    segment_text, 
+                    voice_name,
+                    segment_index=i,
+                    total_segments=len(segments)
+                )
             
-            logger.info(f"Generating segment {i+1}/{len(segments)}: '{formatted_text[:50]}...'")
+            logger.info(f"Generating segment {i+1}/{len(segments)}")
             
             # Generate audio for this segment
             audio_segment = generator.generate(
@@ -298,7 +309,7 @@ async def text_to_speech(
         error_trace = traceback.format_exc()
         logger.error(f"Speech generation failed: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Speech generation failed: {str(e)}")
-
+    
 @router.post("/audio/conversation", tags=["Conversation API"])
 async def conversation_to_speech(
     request: Request,

@@ -129,17 +129,12 @@ def format_text_for_voice(text: str, voice_name: str, segment_index: int = 0, to
     # Check if this is a cloned voice (based on ID pattern or "custom" voice name)
     is_cloned_voice = voice_name == "custom" or "_" in voice_name
     
-    # For cloned voices, use the custom style or create a simpler prompt
+    # For cloned voices, just return the plain text without formatting
+    # This prevents the model from reading the instructions
     if is_cloned_voice:
-        if segment_index == 0 or total_segments == 1:
-            # For first segment, use a simpler, clearer instruction
-            formatted = f"[Speaking in my natural voice, clearly and consistently] {text}"
-        else:
-            # For continuation segments
-            formatted = f"[Continuing in the same clear voice] {text}"
-        return formatted
+        return text
     
-    # For built-in voices, use the more detailed style formatting
+    # For built-in voices, use the detailed style formatting
     if voice_name not in VOICE_STYLES:
         voice_name = "alloy"  # Default fallback
     

@@ -527,7 +527,7 @@ class VoiceCloner:
             if len(processed_text) > 200:
                 logger.info(f"Text is long ({len(processed_text)} chars), splitting for better quality")
                 
-                from app.prompt_engineering import split_into_segments, format_text_for_voice
+                from app.prompt_engineering import split_into_segments
                 
                 # Split text into manageable segments
                 segments = split_into_segments(processed_text, max_chars=150)
@@ -539,17 +539,9 @@ class VoiceCloner:
                 for i, segment_text in enumerate(segments):
                     logger.info(f"Generating segment {i+1}/{len(segments)}")
                     
-                    # Format text for cloned voice
-                    formatted_text = format_text_for_voice(
-                        segment_text, 
-                        "custom",  # Use custom formatting for cloned voices
-                        segment_index=i,
-                        total_segments=len(segments)
-                    )
-                    
-                    # Generate this segment
+                    # Generate this segment - using plain text without formatting
                     segment_audio = self.generator.generate(
-                        text=formatted_text,
+                        text=segment_text,  # Use plain text, no formatting
                         speaker=voice.speaker_id,
                         context=context,
                         max_audio_length_ms=min(max_audio_length_ms, 10000),
@@ -589,18 +581,9 @@ class VoiceCloner:
                 return audio
                 
             else:
-                # For short text, generate directly
-                # Format text for cloned voice
-                from app.prompt_engineering import format_text_for_voice
-                formatted_text = format_text_for_voice(
-                    processed_text, 
-                    "custom",
-                    segment_index=0,
-                    total_segments=1
-                )
-                
+                # For short text, generate directly - using plain text without formatting
                 audio = self.generator.generate(
-                    text=formatted_text,
+                    text=processed_text,  # Use plain text, no formatting
                     speaker=voice.speaker_id,
                     context=context,
                     max_audio_length_ms=max_audio_length_ms,
@@ -613,7 +596,7 @@ class VoiceCloner:
         except Exception as e:
             logger.error(f"Error generating speech with voice {voice_id}: {e}")
             raise
-            
+                
     def _preprocess_text(self, text: str) -> str:
         """Preprocess text for better pronunciation and voice cloning."""
         # Make sure text ends with punctuation for better phrasing
