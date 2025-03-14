@@ -26,7 +26,7 @@ An OpenAI-compatible Text-to-Speech API that harnesses the power of Sesame's Con
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/yourusername/csm-tts-api
+git clone https://github.com/phildougherty/sesame_csm_openai/
 cd csm-tts-api
 ```
 
