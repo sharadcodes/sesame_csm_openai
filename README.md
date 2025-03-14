@@ -30,7 +30,7 @@ git clone https://github.com/phildougherty/sesame_csm_openai
 cd sesame_csm_openai
 ```
 
-2. Create a `.env` file with your Hugging Face token:
+2. Create a `.env` file in the /app folder with your Hugging Face token:
 ```
 HF_TOKEN=your_hugging_face_token_here
 ```
