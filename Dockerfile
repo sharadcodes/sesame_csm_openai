@@ -30,7 +30,11 @@ ENV PYTHONFAULTHANDLER=1 \
     PYTHONHASHSEED=random \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_DEFAULT_TIMEOUT=100
+    PIP_DEFAULT_TIMEOUT=100 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6" \
+    TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

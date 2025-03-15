@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Any, Union
 import torch
 import torchaudio
 import numpy as np
-from fastapi import APIRouter, Request, Response, HTTPException, Body
+from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, Body, Response
 from fastapi.responses import StreamingResponse
 
 from app.api.schemas import TTSRequest, ResponseFormat, Voice
@@ -35,7 +35,8 @@ MIME_TYPES = {
 @router.post("/audio/speech", summary="Generate speech from text")
 async def text_to_speech(
     request: Request,
-    body: Dict[str, Any] = Body(...)
+    background_tasks: BackgroundTasks,
+    body: Dict[str, Any] = Body(...),
 ):
     """
     OpenAI compatible TTS endpoint that generates speech from text using the CSM-1B model.
@@ -47,8 +48,8 @@ async def text_to_speech(
     if generator is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    # Log the request body to debug
-    logger.info(f"Received TTS request: {body}")
+    # Start timing
+    start_time = time.time()
     
     # Extract parameters with fallbacks
     text = body.get("input", "")
@@ -114,137 +115,82 @@ async def text_to_speech(
     response_format = body.get("response_format", "mp3")
     speed = float(body.get("speed", 1.0))
     max_audio_length_ms = float(body.get("max_audio_length_ms", 90000))
+    temperature = float(body.get("temperature", 0.7))  # Lower default for faster, more stable output
+    topk = int(body.get("topk", 50))
     
-    # Voice consistency parameters
-    voice_consistency = float(body.get("voice_consistency", 0.9))  # Higher consistency by default
-    max_context_segments = int(body.get("max_context_segments", 2))  # Number of context segments to use
-    prioritize_consistency = body.get("prioritize_consistency", True)
-    
-    # Adjust temperature based on voice consistency priority
-    temperature = float(body.get("temperature", 0.8))  # Lower default for more consistency
-    if prioritize_consistency:
-        temperature = min(temperature, 0.7)  # Ensure lower temperature for focused generation
-    
-    topk = int(body.get("topk", 40))
+    # MIME types mapping
+    MIME_TYPES = {
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "opus": "audio/opus",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+    }
     
     # Generate audio
     try:
         logger.info(f"Generating audio for: '{text[:100]}...' with voice={voice_name} (speaker={speaker})")
         
-        # Import advanced text and voice processing 
-        from app.prompt_engineering import split_into_segments, format_text_for_voice
-        
-        # Get appropriate context
-        if cloned_voice_id and hasattr(request.app.state, "voice_cloner"):
-            # Use cloned voice context
-            context = request.app.state.voice_cloner.get_voice_context(cloned_voice_id)
-            if context:
-                logger.info(f"Using cloned voice context with {len(context)} segments")
+        # Get voice context for consistent output
+        # This is important for voice quality - don't skip!
+        if hasattr(request.app.state, "voice_memory") and voice_name in request.app.state.voice_memory:
+            context = request.app.state.voice_memory[voice_name]
+            logger.info(f"Using stored voice memory context with {len(context)} segments")
+        elif hasattr(request.app, "voice_memory"):
+            from app.voice_memory import get_voice_context
+            context = get_voice_context(voice_name, generator.device)
+            logger.info(f"Using voice memory context with {len(context)} segments")
         else:
-            # Use standard voice enhancement context
-            from app.voice_enhancement import get_voice_segments
-            context = get_voice_segments(voice_name, generator.device)
-            if context:
-                logger.info(f"Using {len(context)} reference segments for voice consistency")
+            context = []  # No context if voice_memory not available
         
-        # Check if text needs to be split into segments
-        # Splitting helps generate more consistent and complete audio
-        segments = split_into_segments(text, max_chars=200)
-        logger.info(f"Split text into {len(segments)} segments for processing")
+        # CRITICAL FIX: Remove any voice instructions in square brackets
+        # CSM model tries to read these instructions otherwise
+        import re
+        clean_text = re.sub(r'^\s*\[[^\]]*\]\s*', '', text)
         
-        # Process each segment with voice consistency
-        all_audio_chunks = []
+        # Generate audio without prompt/instruction text
+        audio = generator.generate(
+            text=clean_text,
+            speaker=speaker,
+            context=context,
+            max_audio_length_ms=max_audio_length_ms,
+            temperature=temperature,
+            topk=topk,
+        )
         
-        # Determine if this is a cloned voice or a built-in voice
-        is_cloned_voice = cloned_voice_id is not None
-        
-        for i, segment_text in enumerate(segments):
-            # Format text appropriately based on voice type
-            if is_cloned_voice:
-                # For cloned voices, use plain text without formatting
-                formatted_text = segment_text
-            else:
-                # For built-in voices, apply style formatting
-                formatted_text = format_text_for_voice(
-                    segment_text, 
-                    voice_name,
-                    segment_index=i,
-                    total_segments=len(segments)
-                )
+        # Audio post-processing - run in background task if performance becomes an issue
+        try:
+            from app.audio_processing import remove_long_silences, enhance_audio_quality
+            # Remove excessive silences
+            audio = remove_long_silences(audio, generator.sample_rate)
+            # Apply audio enhancement
+            audio = enhance_audio_quality(audio, generator.sample_rate)
+            logger.info("Applied audio post-processing")
+        except Exception as e:
+            logger.warning(f"Audio post-processing failed, using raw audio: {e}")
             
-            logger.info(f"Generating segment {i+1}/{len(segments)}")
-            
-            # Generate audio for this segment
-            audio_segment = generator.generate(
-                text=formatted_text,
-                speaker=speaker,
-                context=context,
-                max_audio_length_ms=min(max_audio_length_ms, 15000),  # Shorter segments for better control
-                temperature=temperature,
-                topk=topk,
+        # Update voice memory in the background for better voice consistency
+        if hasattr(request.app.state, "voice_memory"):
+            from app.voice_memory import update_voice_memory
+            background_tasks.add_task(
+                update_voice_memory, 
+                voice_name=voice_name, 
+                audio=audio.detach().cpu(), 
+                text=clean_text
             )
-            
-            # Process audio for quality and consistency
-            from app.voice_enhancement import process_generated_audio
-            processed_segment = process_generated_audio(
-                audio_segment,
-                voice_name,
-                generator.sample_rate,
-                segment_text
-            )
-            
-            # Add to overall audio
-            all_audio_chunks.append(processed_segment)
-            
-            # Update context for next segment to maintain consistency
-            if len(all_audio_chunks) > 0 and voice_consistency > 0.5:
-                # Use the current segment as context for the next segment
-                # This maintains voice consistency across segments
-                context = [
-                    Segment(
-                        speaker=speaker,
-                        text=segment_text,
-                        audio=processed_segment.to(generator.device)
-                    )
-                ] + context[:max_context_segments-1]  # Keep limited context
-        
-        # Combine audio chunks
-        if len(all_audio_chunks) == 1:
-            audio = all_audio_chunks[0]
-        else:
-            # Add small silence between segments for natural pauses
-            silence_samples = int(0.1 * generator.sample_rate)  # 100ms silence
-            silence = torch.zeros(silence_samples, device=all_audio_chunks[0].device)
-            
-            # Join segments with silence
-            audio_parts = []
-            for i, chunk in enumerate(all_audio_chunks):
-                audio_parts.append(chunk)
-                if i < len(all_audio_chunks) - 1:  # Don't add silence after the last chunk
-                    audio_parts.append(silence)
-                    
-            # Concatenate all parts
-            audio = torch.cat(audio_parts)
-            
-            logger.info(f"Combined {len(all_audio_chunks)} audio chunks, total duration: {audio.shape[0]/generator.sample_rate:.2f}s")
-        
-        # Apply speed adjustment if needed (using resample)
-        if speed != 1.0:
-            # Calculate new sample rate based on speed
-            new_sample_rate = int(generator.sample_rate * speed)
-            audio = torchaudio.functional.resample(
-                audio, 
-                orig_freq=generator.sample_rate, 
-                new_freq=new_sample_rate
-            )
-            # Resample back to original rate to maintain compatibility
-            audio = torchaudio.functional.resample(
-                audio, 
-                orig_freq=new_sample_rate, 
-                new_freq=generator.sample_rate
-            )
-            
-            logger.info(f"Applied speed adjustment: {speed}x")
+                
+        # Apply speed adjustment if needed
+        if speed != 1.0 and speed > 0.25:
+            try:
+                orig_len = audio.shape[0]
+                # Use torchaudio for high-quality stretching
+                audio = torchaudio.functional.speed(
+                    audio.unsqueeze(0), 
+                    factor=speed
+                ).squeeze(0)
+                logger.info(f"Applied speed adjustment: {speed}x, audio length: {orig_len} → {audio.shape[0]}")
+            except Exception as e:
+                logger.warning(f"Speed adjustment failed: {e}")
         
         # Create temporary file for audio conversion
         with tempfile.NamedTemporaryFile(suffix=f".{response_format}", delete=False) as temp_file:
@@ -257,38 +203,53 @@ async def text_to_speech(
         # Convert to requested format using ffmpeg
         import ffmpeg
         
-        if response_format == "mp3":
-            # For MP3, use specific bitrate for better quality
-            (
-                ffmpeg.input(wav_path)
-                .output(temp_path, format='mp3', audio_bitrate='128k')
-                .run(quiet=True, overwrite_output=True)
-            )
-        elif response_format == "opus":
-            (
-                ffmpeg.input(wav_path)
-                .output(temp_path, format='opus')
-                .run(quiet=True, overwrite_output=True)
-            )
-        elif response_format == "aac":
-            (
-                ffmpeg.input(wav_path)
-                .output(temp_path, format='aac')
-                .run(quiet=True, overwrite_output=True)
-            )
-        elif response_format == "flac":
-            (
-                ffmpeg.input(wav_path)
-                .output(temp_path, format='flac')
-                .run(quiet=True, overwrite_output=True)
-            )
-        else:  # wav
-            temp_path = wav_path  # Just use the WAV file directly
-            response_format = "wav"  # Ensure correct MIME type
+        try:
+            if response_format == "mp3":
+                # Higher quality MP3 encoding
+                (
+                    ffmpeg.input(wav_path)
+                    .output(temp_path, format='mp3', audio_bitrate='192k')
+                    .run(quiet=True, overwrite_output=True)
+                )
+            elif response_format == "opus":
+                (
+                    ffmpeg.input(wav_path)
+                    .output(temp_path, format='opus', audio_bitrate='128k')
+                    .run(quiet=True, overwrite_output=True)
+                )
+            elif response_format == "aac":
+                (
+                    ffmpeg.input(wav_path)
+                    .output(temp_path, format='aac', audio_bitrate='192k')
+                    .run(quiet=True, overwrite_output=True)
+                )
+            elif response_format == "flac":
+                (
+                    ffmpeg.input(wav_path)
+                    .output(temp_path, format='flac')
+                    .run(quiet=True, overwrite_output=True)
+                )
+            else:  # wav
+                temp_path = wav_path  # Just use the WAV file directly
+                response_format = "wav"  # Ensure correct MIME type
+        except Exception as e:
+            logger.error(f"Format conversion failed: {e}, returning WAV")
+            temp_path = wav_path
+            response_format = "wav"
         
         # Clean up the temporary WAV file if we created a different format
         if temp_path != wav_path and os.path.exists(wav_path):
             os.unlink(wav_path)
+            
+        # Log performance metrics
+        generation_time = time.time() - start_time
+        audio_duration = len(audio) / generator.sample_rate
+        rtf = generation_time / audio_duration if audio_duration > 0 else 0
+        
+        logger.info(
+            f"TTS completed in {generation_time:.2f}s for {audio_duration:.2f}s of audio. "
+            f"RTF: {rtf:.2f}x, Format: {response_format}"
+        )
         
         # Return audio file as response
         def iterfile():
@@ -301,7 +262,11 @@ async def text_to_speech(
         return StreamingResponse(
             iterfile(),
             media_type=MIME_TYPES.get(response_format, "application/octet-stream"),
-            headers={'Content-Disposition': f'attachment; filename="speech.{response_format}"'}
+            headers={
+                'Content-Disposition': f'attachment; filename="speech.{response_format}"',
+                'X-Processing-Time': f"{generation_time:.2f}",
+                'X-Audio-Duration': f"{audio_duration:.2f}"
+            }
         )
         
     except Exception as e:
@@ -309,7 +274,7 @@ async def text_to_speech(
         error_trace = traceback.format_exc()
         logger.error(f"Speech generation failed: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Speech generation failed: {str(e)}")
-    
+     
 @router.post("/audio/conversation", tags=["Conversation API"])
 async def conversation_to_speech(
     request: Request,

@@ -53,11 +53,9 @@ def initialize_templates():
 
 def split_into_segments(text: str, max_chars: int = 150) -> List[str]:
     """Split text into optimal segments for better generation.
-    
     Args:
         text: Text to split
         max_chars: Maximum characters per segment
-        
     Returns:
         List of text segments
     """
@@ -79,7 +77,7 @@ def split_into_segments(text: str, max_chars: int = 150) -> List[str]:
             if current_segment:
                 segments.append(current_segment.strip())
                 current_segment = ""
-            
+                
             # If this sentence alone exceeds max_chars, split it by phrases
             if len(sentence) > max_chars:
                 phrases = re.split(r'(?<=[,;:])\s+', sentence)
@@ -106,50 +104,26 @@ def split_into_segments(text: str, max_chars: int = 150) -> List[str]:
                 current_segment = sentence
         else:
             current_segment += " " + sentence if current_segment else sentence
-    
+            
     # Add the last segment
     if current_segment:
         segments.append(current_segment.strip())
-    
+        
     logger.info(f"Split text into {len(segments)} segments")
     return segments
 
 def format_text_for_voice(text: str, voice_name: str, segment_index: int = 0, total_segments: int = 1) -> str:
     """Format text with voice characteristics for more consistent generation.
-    
     Args:
         text: Text to format
         voice_name: Name of the voice
         segment_index: Index of this segment (for multi-segment texts)
         total_segments: Total number of segments
-        
     Returns:
         Formatted text optimized for consistent voice generation
     """
-    # Check if this is a cloned voice (based on ID pattern or "custom" voice name)
-    is_cloned_voice = voice_name == "custom" or "_" in voice_name
+    # IMPORTANT: We no longer add voice instructions in brackets since CSM reads them aloud
+    # Instead, we're using speaker IDs to control voice identity which is what the model expects
     
-    # For cloned voices, just return the plain text without formatting
-    # This prevents the model from reading the instructions
-    if is_cloned_voice:
-        return text
-    
-    # For built-in voices, use the detailed style formatting
-    if voice_name not in VOICE_STYLES:
-        voice_name = "alloy"  # Default fallback
-    
-    style = VOICE_STYLES[voice_name]
-    
-    # Select voice characteristic adjectives
-    adj1, adj2 = random.sample(style["adjectives"], 2)
-    char1, char2 = random.sample(style["characteristics"], 2)
-    
-    # Add voice consistency cues only to first segment or single segments
-    if segment_index == 0 or total_segments == 1:
-        prefix = f"[Speaking in a {adj1}, {adj2} voice with {char1} and {char2}] "
-        formatted = prefix + text
-    else:
-        # For continuation segments, use a simpler cue
-        formatted = f"[Continuing in the same {style['speaking_style']} voice] " + text
-    
-    return formatted
+    # Just return the unmodified text - the Generator class will handle proper formatting
+    return text
