@@ -15,17 +15,13 @@ from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-
 from app.api.routes import router as api_router
-
 # Setup logging
 os.makedirs("logs", exist_ok=True)
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-
 # Console handler
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter(log_format))
-
 # File handler
 file_handler = RotatingFileHandler(
     "logs/csm_tts_api.log", 
@@ -33,24 +29,20 @@ file_handler = RotatingFileHandler(
     backupCount=5
 )
 file_handler.setFormatter(logging.Formatter(log_format))
-
 # Configure root logger
 logging.basicConfig(
     level=logging.INFO,
     format=log_format,
     handlers=[console_handler, file_handler]
 )
-
 logger = logging.getLogger(__name__)
 logger.info("Starting CSM-1B TTS API")
-
 # Initialize FastAPI app
 app = FastAPI(
     title="CSM-1B TTS API",
     description="OpenAI-compatible TTS API using the CSM-1B model from Sesame",
     version="1.0.0"
 )
-
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -59,25 +51,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # Create static and other required directories
 os.makedirs("static", exist_ok=True)
 os.makedirs("cloned_voices", exist_ok=True)
-
 # Mount the static files directory
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
 # Include routers
 app.include_router(api_router, prefix="/api/v1")
-
 # Add OpenAI compatible route
 app.include_router(api_router, prefix="/v1")
-
 # Add voice cloning routes
 from app.api.voice_cloning_routes import router as voice_cloning_router
 app.include_router(voice_cloning_router, prefix="/api/v1")
 app.include_router(voice_cloning_router, prefix="/v1")
-
 # Middleware for request timing
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
@@ -88,7 +74,6 @@ async def add_process_time_header(request: Request, call_next):
     response.headers["X-Process-Time"] = str(process_time)
     logger.debug(f"Request to {request.url.path} processed in {process_time:.3f} seconds")
     return response
-
 @app.on_event("startup")
 async def startup_event():
     """Application startup event that loads the model and initializes voices."""
@@ -192,7 +177,7 @@ async def startup_event():
         # Initialize voice enhancement system (this will create proper voice profiles)
         logger.info("Initializing voice enhancement system...")
         try:
-            from app.voice_enhancement import initialize_voice_profiles
+            from app.voice_enhancement import initialize_voice_profiles, save_voice_profiles
             initialize_voice_profiles()
             logger.info("Voice profiles initialized successfully")
         except Exception as e:
@@ -203,12 +188,20 @@ async def startup_event():
         # Initialize voice cloning system
         try:
             logger.info("Initializing voice cloning system...")
-            from app.voice_cloning import VoiceCloner
+            from app.voice_cloning import VoiceCloner, CLONED_VOICES_DIR
+            
+            # Update the cloned voices directory to use the persistent volume
+            CLONED_VOICES_DIR = "/app/cloned_voices"
+            os.makedirs(CLONED_VOICES_DIR, exist_ok=True)
+            
             app.state.voice_cloner = VoiceCloner(app.state.generator, device=device)
-            logger.info(f"Voice cloning system initialized with {len(app.state.voice_cloner.list_voices())} existing voices")
+            
+            # Make sure existing voices are loaded
+            app.state.voice_cloner._load_existing_voices()
+            logger.info(f"Voice cloning system initialized with {len(app.state.voice_cloner.list_voices())} existing voices from {CLONED_VOICES_DIR}")
         except Exception as e:
             error_stack = traceback.format_exc()
-            logger.error(f"Error initializing voice cloning: {str(e)}\n{error_stack}")
+            logger.error(f"Error initializing voice cloning: {e}\n{error_stack}")
             logger.warning("Voice cloning features will not be available")
         
         # Create prompt templates for consistent generation
@@ -219,7 +212,7 @@ async def startup_event():
             logger.info("Prompt templates initialized")
         except Exception as e:
             error_stack = traceback.format_exc()
-            logger.error(f"Error initializing prompt templates: {str(e)}\n{error_stack}")
+            logger.error(f"Error initializing prompt templates: {e}\n{error_stack}")
             logger.warning("Voice consistency features will be limited")
         
         # Generate voice reference samples (runs in background to avoid blocking startup)
@@ -456,7 +449,6 @@ async def startup_event():
             <audio id="audio-preview" controls style="display: none;"></audio>
         </div>
     </div>
-
     <script>
         // Tab functionality
         const tabs = document.querySelectorAll('.tabs button');
@@ -708,7 +700,6 @@ async def startup_event():
         logger.info("Voice cloning UI template created successfully")
     except Exception as e:
         logger.error(f"Error creating voice cloning UI template: {e}")
-
 @app.on_event("shutdown")
 async def shutdown_event():
     """Application shutdown event that cleans up resources."""
@@ -735,7 +726,6 @@ async def shutdown_event():
         logger.error(f"Error saving voice profiles: {e}")
     
     logger.info("Application shutdown complete")
-
 # Health check endpoint
 @app.get("/health", include_in_schema=False)
 async def health_check():
@@ -777,7 +767,6 @@ async def health_check():
         "cuda": cuda_stats,
         "version": "1.0.0"
     }
-
 # Version endpoint
 @app.get("/version", include_in_schema=False)
 async def version():
@@ -789,19 +778,16 @@ async def version():
         "enhancements": "voice consistency and audio quality v1.0",
         "voice_cloning": "enabled" if hasattr(app.state, "voice_cloner") else "disabled"
     }
-
 # Voice cloning UI endpoint
 @app.get("/voice-cloning", include_in_schema=False)
 async def voice_cloning_ui():
     """Voice cloning UI endpoint."""
     return FileResponse("static/voice-cloning.html")
-
 @app.get("/", include_in_schema=False)
 async def root():
     """Root endpoint that redirects to docs."""
     logger.debug("Root endpoint accessed, redirecting to docs")
     return RedirectResponse(url="/docs")
-
 if __name__ == "__main__":
     # Get port from environment or use default
     port = int(os.environ.get("PORT", 8000))

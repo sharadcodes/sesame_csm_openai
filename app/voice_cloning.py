@@ -25,7 +25,7 @@ from app.models import Segment
 logger = logging.getLogger(__name__)
 
 # Directory for storing cloned voice data
-CLONED_VOICES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cloned_voices")
+CLONED_VOICES_DIR = "/app/cloned_voices"
 os.makedirs(CLONED_VOICES_DIR, exist_ok=True)
 
 class ClonedVoice(BaseModel):

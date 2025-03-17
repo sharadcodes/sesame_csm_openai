@@ -32,6 +32,7 @@ models/
 tokenizers/
 voice_memories/
 voice_samples/
+cloned_voices/
 *.pt
 *.pth
 *.bin
