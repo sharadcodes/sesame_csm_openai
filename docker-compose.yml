@@ -9,6 +9,8 @@ services:
       - "8000:8000"
     volumes:
       - ./models:/app/models
+      - ./cloned_voices:/app/cloned_voices
+
     environment:
       - HF_TOKEN=${HF_TOKEN}  
     deploy:
