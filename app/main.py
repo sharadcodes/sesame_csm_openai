@@ -258,45 +258,103 @@ async def startup_event():
     try:
         voice_cloning_html = """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Voice Cloning</title>
     <style>
+        :root {
+            --bg-color: #ffffff;
+            --text-color: #333333;
+            --card-bg: #ffffff;
+            --card-border: #cccccc;
+            --card-shadow: rgba(0,0,0,0.1);
+            --primary-color: #4f46e5;
+            --primary-hover: #4338ca;
+            --secondary-color: #6b7280;
+            --secondary-hover: #4b5563;
+            --danger-color: #ef4444;
+            --danger-hover: #dc2626;
+            --input-bg: #ffffff;
+            --input-border: #cccccc;
+            --voice-card-bg: #f9fafb;
+            --voice-card-border: #eeeeee;
+            --tab-border: #e5e7eb;
+            --tab-text: #4b5563;
+            --tab-active: #4f46e5;
+            --toggle-bg: #e5e7eb;
+            --toggle-circle: #ffffff;
+        }
+        
+        [data-theme="dark"] {
+            --bg-color: #1f2937;
+            --text-color: #e5e7eb;
+            --card-bg: #374151;
+            --card-border: #4b5563;
+            --card-shadow: rgba(0,0,0,0.3);
+            --primary-color: #6366f1;
+            --primary-hover: #4f46e5;
+            --secondary-color: #9ca3af;
+            --secondary-hover: #6b7280;
+            --danger-color: #f87171;
+            --danger-hover: #ef4444;
+            --input-bg: #4b5563;
+            --input-border: #6b7280;
+            --voice-card-bg: #374151;
+            --voice-card-border: #4b5563;
+            --tab-border: #4b5563;
+            --tab-text: #9ca3af;
+            --tab-active: #6366f1;
+            --toggle-bg: #4b5563;
+            --toggle-circle: #e5e7eb;
+        }
+        
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
             max-width: 800px;
             margin: 0 auto;
             padding: 20px;
             line-height: 1.6;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            transition: background-color 0.3s, color 0.3s;
         }
+        
         h1, h2 {
-            color: #333;
+            color: var(--text-color);
         }
+        
         .card {
-            border: 1px solid #ccc;
+            border: 1px solid var(--card-border);
             border-radius: 8px;
             padding: 16px;
             margin-bottom: 16px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            box-shadow: 0 2px 4px var(--card-shadow);
+            background-color: var(--card-bg);
         }
+        
         .form-group {
             margin-bottom: 16px;
         }
+        
         label {
             display: block;
             margin-bottom: 4px;
             font-weight: 500;
         }
+        
         input, textarea, select {
             width: 100%;
             padding: 8px;
-            border: 1px solid #ccc;
+            border: 1px solid var(--input-border);
             border-radius: 4px;
+            background-color: var(--input-bg);
+            color: var(--text-color);
         }
+        
         button {
-            background-color: #4f46e5;
+            background-color: var(--primary-color);
             color: white;
             border: none;
             border-radius: 4px;
@@ -304,54 +362,66 @@ async def startup_event():
             cursor: pointer;
             font-weight: 500;
         }
+        
         button:hover {
-            background-color: #4338ca;
+            background-color: var(--primary-hover);
         }
+        
         .voice-list {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
             gap: 16px;
         }
+        
         .voice-card {
-            border: 1px solid #eee;
+            border: 1px solid var(--voice-card-border);
             border-radius: 8px;
             padding: 16px;
-            background-color: #f9fafb;
+            background-color: var(--voice-card-bg);
         }
+        
         .controls {
             display: flex;
             gap: 8px;
             margin-top: 8px;
         }
+        
         .voice-name {
             font-weight: 600;
             font-size: 18px;
             margin: 0 0 8px 0;
         }
+        
         .btn-danger {
-            background-color: #ef4444;
+            background-color: var(--danger-color);
         }
+        
         .btn-danger:hover {
-            background-color: #dc2626;
+            background-color: var(--danger-hover);
         }
+        
         .btn-secondary {
-            background-color: #6b7280;
+            background-color: var(--secondary-color);
         }
+        
         .btn-secondary:hover {
-            background-color: #4b5563;
+            background-color: var(--secondary-hover);
         }
+        
         #audio-preview {
             margin-top: 16px;
             width: 100%;
         }
+        
         .tabs {
             display: flex;
             margin-bottom: 16px;
-            border-bottom: 1px solid #e5e7eb;
+            border-bottom: 1px solid var(--tab-border);
         }
+        
         .tabs button {
             background-color: transparent;
-            color: #4b5563;
+            color: var(--tab-text);
             border: none;
             padding: 8px 16px;
             margin-right: 8px;
@@ -360,30 +430,109 @@ async def startup_event():
             font-weight: 500;
             border-radius: 0;
         }
+        
         .tabs button.active {
-            color: #4f46e5;
+            color: var(--tab-active);
         }
+        
         .tabs button.active::after {
             content: '';
             position: absolute;
             bottom: -1px;
-            left: Int * 88;
+            left: 0;
             right: 0;
             height: 2px;
-            background-color: #4f46e5;
+            background-color: var(--tab-active);
         }
+        
         .tab-content {
             display: none;
         }
+        
         .tab-content.active {
             display: block;
         }
+        
         #generate-form .form-group + .form-group {
             margin-top: 16px;
+        }
+        
+        /* Theme toggle switch */
+        .theme-switch-wrapper {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            margin-bottom: 16px;
+        }
+        
+        .theme-switch {
+            display: inline-block;
+            height: 24px;
+            position: relative;
+            width: 48px;
+        }
+        
+        .theme-switch input {
+            display: none;
+        }
+        
+        .slider {
+            background-color: var(--toggle-bg);
+            bottom: 0;
+            cursor: pointer;
+            left: 0;
+            position: absolute;
+            right: 0;
+            top: 0;
+            transition: .4s;
+            border-radius: 24px;
+        }
+        
+        .slider:before {
+            background-color: var(--toggle-circle);
+            bottom: 4px;
+            content: "";
+            height: 16px;
+            left: 4px;
+            position: absolute;
+            transition: .4s;
+            width: 16px;
+            border-radius: 50%;
+        }
+        
+        input:checked + .slider {
+            background-color: var(--primary-color);
+        }
+        
+        input:checked + .slider:before {
+            transform: translateX(24px);
+        }
+        
+        .theme-switch-wrapper span {
+            margin-right: 8px;
+            font-size: 14px;
+        }
+        
+        /* Icons for dark/light mode */
+        .theme-icon {
+            width: 16px;
+            height: 16px;
+            display: inline-block;
+            margin-right: 8px;
+            vertical-align: middle;
         }
     </style>
 </head>
 <body>
+    <div class="theme-switch-wrapper">
+        <span class="theme-icon">☀️</span>
+        <label class="theme-switch" for="checkbox">
+            <input type="checkbox" id="checkbox" />
+            <div class="slider"></div>
+        </label>
+        <span class="theme-icon">🌙</span>
+    </div>
+    
     <h1>Voice Cloning</h1>
     
     <div class="tabs">
@@ -450,6 +599,39 @@ async def startup_event():
         </div>
     </div>
     <script>
+        // Theme toggle functionality
+        const toggleSwitch = document.querySelector('#checkbox');
+        const html = document.querySelector('html');
+        
+        // Check for saved theme preference or use system preference
+        function getThemePreference() {
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme) {
+                return savedTheme;
+            }
+            // Check if system prefers dark mode
+            return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        
+        // Apply the theme
+        function setTheme(theme) {
+            html.setAttribute('data-theme', theme);
+            localStorage.setItem('theme', theme);
+            toggleSwitch.checked = theme === 'dark';
+        }
+        
+        // Initialize theme
+        setTheme(getThemePreference());
+        
+        // Listen for toggle changes
+        toggleSwitch.addEventListener('change', function(e) {
+            if (e.target.checked) {
+                setTheme('dark');
+            } else {
+                setTheme('light');
+            }
+        });
+        
         // Tab functionality
         const tabs = document.querySelectorAll('.tabs button');
         const tabContents = document.querySelectorAll('.tab-content');
