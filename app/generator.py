@@ -128,8 +128,8 @@ class Generator:
     def _clean_text_input(self, text: str) -> str:
         """Remove any voice instructions in square brackets to prevent them being read aloud."""
         import re
-        # Remove anything inside square brackets at the beginning
-        text = re.sub(r'^\s*\[[^\]]*\]\s*', '', text)
+        # Fix the regex pattern to properly match and remove text in square brackets
+        text = re.sub(r'\[.*?\]', '', text)
         return text
 
     def _tokenize_audio(self, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
