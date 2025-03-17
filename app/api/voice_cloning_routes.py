@@ -85,6 +85,58 @@ async def delete_voice(request: Request, voice_id: str):
         "message": f"Voice {voice_id} deleted successfully"
     }
 
+# In app/api/voice_cloning_routes.py
+
+@router.post("/clone-from-youtube", summary="Clone a voice from YouTube")
+async def clone_voice_from_youtube(
+    request: Request,
+    data: dict = Body(...)  # Use a single body parameter to avoid conflicts
+):
+    """
+    Clone a voice from a YouTube video.
+    
+    - **youtube_url**: URL of the YouTube video
+    - **voice_name**: Name for the cloned voice
+    - **start_time**: Start time in seconds (default: 0)
+    - **duration**: Duration to extract in seconds (default: 180)
+    - **description**: Optional description of the voice
+    """
+    if not hasattr(request.app.state, "voice_cloner"):
+        raise HTTPException(status_code=503, detail="Voice cloning service not available")
+    
+    voice_cloner = request.app.state.voice_cloner
+    
+    # Extract parameters from the request body
+    youtube_url = data.get("youtube_url")
+    voice_name = data.get("voice_name")
+    start_time = data.get("start_time", 0)
+    duration = data.get("duration", 180)
+    description = data.get("description")
+    
+    # Validate required parameters
+    if not youtube_url or not voice_name:
+        raise HTTPException(status_code=400, detail="Missing required parameters: youtube_url and voice_name")
+    
+    try:
+        voice = await voice_cloner.clone_voice_from_youtube(
+            youtube_url=youtube_url,
+            voice_name=voice_name,
+            start_time=start_time,
+            duration=duration,
+            description=description
+        )
+        
+        return {
+            "status": "success",
+            "message": "Voice cloned successfully from YouTube",
+            "voice": voice
+        }
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        request.app.state.logger.error(f"YouTube voice cloning failed: {e}\n{error_trace}")
+        raise HTTPException(status_code=500, detail=f"YouTube voice cloning failed: {str(e)}")
+    
 @router.post("/generate", summary="Generate speech with cloned voice")
 async def generate_speech(
     request: Request,

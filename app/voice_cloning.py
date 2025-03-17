@@ -10,6 +10,8 @@ import time
 import tempfile
 import logging
 import asyncio
+import yt_dlp
+import whisper
 from typing import Dict, List, Optional, Union, Tuple, BinaryIO
 from pathlib import Path
 
@@ -487,6 +489,121 @@ class VoiceCloner:
                 return False
         
         return False
+
+    async def clone_voice_from_youtube(
+        self,  # Don't forget the self parameter for class methods
+        youtube_url: str,
+        voice_name: str,
+        start_time: int = 0,
+        duration: int = 180,
+        description: str = None
+    ) -> ClonedVoice:
+        """
+        Clone a voice from a YouTube video.
+        
+        Args:
+            youtube_url: URL of the YouTube video
+            voice_name: Name for the cloned voice
+            start_time: Start time in seconds
+            duration: Duration to extract in seconds
+            description: Optional description of the voice
+            
+        Returns:
+            ClonedVoice object with voice information
+        """
+        logger.info(f"Cloning voice '{voice_name}' from YouTube: {youtube_url}")
+        
+        # Create temporary directory for processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Step 1: Download audio from YouTube
+            audio_path = await self._download_youtube_audio(youtube_url, temp_dir, start_time, duration)
+            
+            # Step 2: Generate transcript using Whisper
+            transcript = await self._generate_transcript(audio_path)
+            
+            # Step 3: Clone the voice using the extracted audio and transcript
+            voice = await self.clone_voice(
+                audio_file=audio_path,
+                voice_name=voice_name,
+                transcript=transcript,
+                description=description or f"Voice cloned from YouTube: {youtube_url}"
+            )
+            
+            return voice
+
+    async def _download_youtube_audio(
+        self,  # Don't forget the self parameter
+        url: str, 
+        output_dir: str, 
+        start_time: int = 0, 
+        duration: int = 180
+    ) -> str:
+        """
+        Download audio from a YouTube video.
+        
+        Args:
+            url: YouTube URL
+            output_dir: Directory to save the audio
+            start_time: Start time in seconds
+            duration: Duration to extract in seconds
+            
+        Returns:
+            Path to the downloaded audio file
+        """
+        output_path = os.path.join(output_dir, "youtube_audio.wav")
+        
+        # Configure yt-dlp options
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'wav',
+                'preferredquality': '192',
+            }],
+            'outtmpl': output_path.replace(".wav", ""),
+            'quiet': True,
+            'no_warnings': True
+        }
+        
+        # Download the video
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        # Trim the audio to the specified segment
+        if start_time > 0 or duration < float('inf'):
+            import ffmpeg
+            trimmed_path = os.path.join(output_dir, "trimmed_audio.wav")
+            
+            # Use ffmpeg to trim the audio
+            (
+                ffmpeg.input(output_path)
+                .audio
+                .filter('atrim', start=start_time, duration=duration)
+                .output(trimmed_path)
+                .run(quiet=True, overwrite_output=True)
+            )
+            
+            return trimmed_path
+        
+        return output_path
+
+    async def _generate_transcript(self, audio_path: str) -> str:
+        """
+        Generate transcript from audio using Whisper.
+        
+        Args:
+            audio_path: Path to the audio file
+            
+        Returns:
+            Transcript text
+        """
+        # Load Whisper model (use small model for faster processing)
+        model = whisper.load_model("small")
+        
+        # Transcribe the audio
+        result = model.transcribe(audio_path)
+        
+        return result["text"]
 
     async def generate_speech(
         self,
