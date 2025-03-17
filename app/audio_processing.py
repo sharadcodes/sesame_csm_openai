@@ -2,6 +2,7 @@
 import logging
 import numpy as np
 import torch
+from scipy import signal
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,52 @@ def remove_long_silences(
     # Return as tensor with original device and dtype
     return torch.tensor(processed_audio, device=audio.device, dtype=audio.dtype)
 
+def create_high_shelf_filter(audio, sample_rate, frequency=4000, gain_db=3.0):
+    """
+    Create a high shelf filter to boost frequencies above the given frequency.
+    
+    Args:
+        audio: Audio numpy array
+        sample_rate: Sample rate in Hz
+        frequency: Shelf frequency in Hz
+        gain_db: Gain in dB for frequencies above the shelf
+        
+    Returns:
+        Filtered audio
+    """
+    # Convert gain from dB to linear
+    gain = 10 ** (gain_db / 20.0)
+    
+    # Normalized frequency (0 to 1, where 1 is Nyquist frequency)
+    normalized_freq = 2.0 * frequency / sample_rate
+    
+    # Design a high-shelf biquad filter
+    # This is a standard second-order section (SOS) implementation
+    b0 = gain
+    b1 = 0
+    b2 = 0
+    a0 = 1
+    a1 = 0
+    a2 = 0
+    
+    # Simple first-order high-shelf filter
+    alpha = np.sin(np.pi * normalized_freq) / 2 * np.sqrt((gain + 1/gain) * (1/0.5 - 1) + 2)
+    cos_w0 = np.cos(np.pi * normalized_freq)
+    
+    b0 = gain * ((gain + 1) + (gain - 1) * cos_w0 + 2 * np.sqrt(gain) * alpha)
+    b1 = -2 * gain * ((gain - 1) + (gain + 1) * cos_w0)
+    b2 = gain * ((gain + 1) + (gain - 1) * cos_w0 - 2 * np.sqrt(gain) * alpha)
+    a0 = (gain + 1) - (gain - 1) * cos_w0 + 2 * np.sqrt(gain) * alpha
+    a1 = 2 * ((gain - 1) - (gain + 1) * cos_w0)
+    a2 = (gain + 1) - (gain - 1) * cos_w0 - 2 * np.sqrt(gain) * alpha
+    
+    # Normalize coefficients
+    b = np.array([b0, b1, b2]) / a0
+    a = np.array([1.0, a1/a0, a2/a0])
+    
+    # Apply the filter
+    return signal.lfilter(b, a, audio)
+
 def enhance_audio_quality(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
     """
     Enhance audio quality by applying various processing techniques.
@@ -146,8 +193,6 @@ def enhance_audio_quality(audio: torch.Tensor, sample_rate: int) -> torch.Tensor
         audio_np = audio_np - np.mean(audio_np)
         
         # Apply light compression to improve perceived loudness
-        from scipy import signal
-        
         # Compress by reducing peaks and increasing quieter parts slightly
         threshold = 0.5
         ratio = 1.5
@@ -169,10 +214,9 @@ def enhance_audio_quality(audio: torch.Tensor, sample_rate: int) -> torch.Tensor
         
         audio_np = audio_np * gain
         
-        # Optional: Apply subtle EQ to enhance speech clarity
-        # Boost mid-high frequencies slightly
-        sos = signal.butter(2, 4000, 'highshelf', fs=sample_rate, output='sos')
-        audio_np = signal.sosfilt(sos, audio_np)
+        # Apply high-shelf filter to enhance speech clarity
+        # Boost frequencies above 4000 Hz by 3 dB
+        audio_np = create_high_shelf_filter(audio_np, sample_rate, frequency=4000, gain_db=3.0)
         
         # Normalize to prevent clipping
         max_val = np.max(np.abs(audio_np))
