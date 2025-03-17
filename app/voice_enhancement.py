@@ -478,6 +478,23 @@ def get_voice_segments(voice_name: str, device: torch.device) -> List:
     logger.info(f"Returning {len(context)} context segments for {voice_name}")
     return context
 
+def save_voice_profiles():
+    """Save voice profiles to disk."""
+    voice_profiles_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "voice_profiles")
+    os.makedirs(voice_profiles_dir, exist_ok=True)
+    profile_path = os.path.join(voice_profiles_dir, "voice_profiles.pt")
+    
+    # Create a serializable version of the profiles
+    serializable_profiles = {}
+    for name, profile in VOICE_PROFILES.items():
+        serializable_profiles[name] = {
+            'reference_segments': [seg.cpu() for seg in profile.reference_segments]
+        }
+    
+    # Save to disk
+    torch.save(serializable_profiles, profile_path)
+    logger.info(f"Saved voice profiles to {profile_path}")
+    
 def process_generated_audio(
     audio: torch.Tensor, 
     voice_name: str, 
