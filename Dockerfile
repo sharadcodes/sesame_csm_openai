@@ -52,6 +52,7 @@ WORKDIR /app
 
 # Copy requirements first for better caching
 COPY requirements.txt .
+COPY ./static /app/static
 
 # Install Python dependencies
 RUN pip3 install --no-cache-dir --upgrade pip && \
