@@ -120,10 +120,22 @@ async def startup_event():
     else:
         logger.warning("CUDA is not available. Using CPU (this will be slow)")
     
-    # Determine device
+    # Determine device and device mapping
     device = "cuda" if cuda_available else "cpu"
+    device_map = os.environ.get("CSM_DEVICE_MAP", None)  # Options: "auto", "balanced", "sequential"
+    
+    if device_map and cuda_available:
+        if torch.cuda.device_count() > 1:
+            logger.info(f"Using device mapping strategy: {device_map} across {torch.cuda.device_count()} GPUs")
+        else:
+            logger.info("Device mapping requested but only one GPU available, ignoring device_map")
+            device_map = None
+    else:
+        device_map = None
+    
     logger.info(f"Using device: {device}")
     app.state.device = device
+    app.state.device_map = device_map
     
     # Check if model file exists
     model_path = os.path.join("models", "ckpt.pt")
@@ -165,7 +177,7 @@ async def startup_event():
         load_start = time.time()
         
         from app.generator import load_csm_1b
-        app.state.generator = load_csm_1b(model_path, device)
+        app.state.generator = load_csm_1b(model_path, device, device_map)
         
         load_time = time.time() - load_start
         logger.info(f"Model loaded successfully in {load_time:.2f} seconds")
@@ -238,10 +250,19 @@ async def startup_event():
         app.state.model_info = {
             "name": "CSM-1B",
             "device": device,
+            "device_map": device_map,
             "sample_rate": app.state.sample_rate,
             "voices": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
             "enhancements_enabled": True
         }
+        
+        # Log GPU utilization after model loading
+        if cuda_available and torch.cuda.device_count() > 1 and device_map:
+            logger.info("Multi-GPU setup active with the following memory usage:")
+            for i in range(torch.cuda.device_count()):
+                memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                logger.info(f"GPU {i}: {memory_allocated:.2f} GB allocated, {memory_reserved:.2f} GB reserved")
         
         logger.info(f"CSM-1B TTS API is ready on {device} with sample rate {app.state.sample_rate}")
         
