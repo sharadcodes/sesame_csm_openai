@@ -8,6 +8,9 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 from tokenizers.processors import TemplateProcessing
 from app.models import Segment
+from app.text_normalizer import clean_text_for_tts
+from app.text_normalizer import TextNormalizer
+
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -125,11 +128,8 @@ class Generator:
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
     
     def _clean_text_input(self, text: str) -> str:
-        """Remove any voice instructions in square brackets to prevent them being read aloud."""
-        import re
-        # Fix the regex pattern to properly match and remove text in square brackets
-        text = re.sub(r'\[.*?\]', '', text)
-        return text
+        """Clean and normalize text for TTS."""
+        return clean_text_for_tts(text)
     
     def _tokenize_audio(self, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize audio."""
@@ -156,7 +156,7 @@ class Generator:
         text_tokens, text_masks = self._tokenize_text_segment(segment.text, segment.speaker)
         audio_tokens, audio_masks = self._tokenize_audio(segment.audio)
         return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
-    
+
     @torch.inference_mode()
     def generate(
         self,
@@ -180,103 +180,252 @@ class Generator:
         
         # Convert max_audio_length_ms to frames - this controls the maximum generation length
         max_audio_frames = min(int(max_audio_length_ms / 80), 1024)  # Limit to reasonable size
-        tokens, tokens_mask = [], []
-        
-        # Add context segments
-        for segment in context:
-            segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
-            tokens.append(segment_tokens)
-            tokens_mask.append(segment_tokens_mask)
-        
-        # Add current segment - clean text here to avoid voice instructions being read
-        cleaned_text = self._clean_text_input(text)
-        gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(cleaned_text, speaker)
-        tokens.append(gen_segment_tokens)
-        tokens_mask.append(gen_segment_tokens_mask)
-        
-        prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
-        prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
-        
-        # Check context size to avoid exceeding model's capacity
         max_seq_len = 2048 - max_audio_frames
-        if prompt_tokens.size(0) >= max_seq_len:
-            logger.warning(f"Inputs too long ({prompt_tokens.size(0)} tokens), truncating to {max_seq_len - 50}")
-            # Truncate but preserve most recent context
-            prompt_tokens = prompt_tokens[-max_seq_len+50:]
-            prompt_tokens_mask = prompt_tokens_mask[-max_seq_len+50:]
         
-        # Generate audio - optimized batch generation
-        curr_tokens = prompt_tokens.unsqueeze(0)
-        curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
-        curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
-        
-        # Using optimized batch generation approach - much faster than frame-by-frame
-        batch_size = 32  # Generate this many frames at once
-        all_samples = []
-        
-        for start_idx in range(0, max_audio_frames, batch_size):
-            # Generate a batch of frames at once
-            end_idx = min(start_idx + batch_size, max_audio_frames)
-            batch_frames = end_idx - start_idx
+        # Check if text is long and should be split
+        if len(text) > 200:
+            logger.info(f"Long text detected ({len(text)} chars), processing in segments")
+            sentences = TextNormalizer.split_into_sentences(text)
+            logger.info(f"Split into {len(sentences)} segments")
             
-            # Generate samples for this batch
-            samples_batch = []
+            # Process sentences individually and concatenate the results
+            all_audio_segments = []
             
-            # Initial generation
-            for i in range(batch_frames):
-                # Generate one frame
-                sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
-                samples_batch.append(sample)
+            # Use the first sentence to establish voice
+            first_sentence = sentences[0]
+            cleaned_text = clean_text_for_tts(first_sentence)
+            
+            # Generate the first segment
+            tokens, tokens_mask = [], []
+            
+            # Add context segments for the first sentence
+            for segment in context:
+                segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
+                tokens.append(segment_tokens)
+                tokens_mask.append(segment_tokens_mask)
+            
+            # Add first sentence tokens
+            gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(cleaned_text, speaker)
+            tokens.append(gen_segment_tokens)
+            tokens_mask.append(gen_segment_tokens_mask)
+            
+            prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
+            prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
+            
+            # Check context size and truncate if needed
+            if prompt_tokens.size(0) >= max_seq_len:
+                logger.warning(f"Inputs too long ({prompt_tokens.size(0)} tokens), truncating to {max_seq_len - 50}")
+                prompt_tokens = prompt_tokens[-max_seq_len+50:]
+                prompt_tokens_mask = prompt_tokens_mask[-max_seq_len+50:]
+            
+            # Generate first sentence audio
+            curr_tokens = prompt_tokens.unsqueeze(0)
+            curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
+            curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
+            
+            # Generate first segment
+            first_segment_samples = []
+            for start_idx in range(0, max_audio_frames, 32):
+                end_idx = min(start_idx + 32, max_audio_frames)
+                batch_frames = end_idx - start_idx
+                samples_batch = []
                 
-                # Check for EOS
-                if torch.all(sample == 0):
+                for i in range(batch_frames):
+                    sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+                    samples_batch.append(sample)
+                    
+                    if torch.all(sample == 0):
+                        break
+                    
+                    curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+                    curr_tokens_mask = torch.cat(
+                        [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                    ).unsqueeze(1)
+                    curr_pos = curr_pos[:, -1:] + 1
+                
+                first_segment_samples.extend(samples_batch)
+                
+                if len(samples_batch) < batch_frames:
                     break
+            
+            if not first_segment_samples:
+                raise RuntimeError("No audio generated for first segment")
+            
+            # Decode first segment
+            first_segment_audio = self._audio_tokenizer.decode(
+                torch.stack(first_segment_samples).permute(1, 2, 0)
+            ).squeeze(0).squeeze(0)
+            
+            all_audio_segments.append(first_segment_audio)
+            
+            # Now process remaining sentences using the first as context
+            for i, sentence in enumerate(sentences[1:], 1):
+                logger.info(f"Generating segment {i+1}/{len(sentences)}")
+                cleaned_text = clean_text_for_tts(sentence)
                 
-                # Update context for next frame
-                curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
-                curr_tokens_mask = torch.cat(
-                    [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
-                ).unsqueeze(1)
-                curr_pos = curr_pos[:, -1:] + 1
+                # Create a context segment from the previous generation
+                prev_segment = Segment(
+                    speaker=speaker,
+                    text=sentences[i-1],
+                    audio=all_audio_segments[-1]
+                )
+                
+                # Generate with this segment as context
+                segment_tokens, segment_tokens_mask = [], []
+                segment_tokens.append(self._tokenize_segment(prev_segment)[0])
+                segment_tokens_mask.append(self._tokenize_segment(prev_segment)[1])
+                
+                # Add current segment tokens
+                current_tokens, current_tokens_mask = self._tokenize_text_segment(cleaned_text, speaker)
+                segment_tokens.append(current_tokens)
+                segment_tokens_mask.append(current_tokens_mask)
+                
+                segment_prompt_tokens = torch.cat(segment_tokens, dim=0).long().to(self.device)
+                segment_prompt_tokens_mask = torch.cat(segment_tokens_mask, dim=0).bool().to(self.device)
+                
+                # Check length and truncate if needed
+                if segment_prompt_tokens.size(0) >= max_seq_len:
+                    segment_prompt_tokens = segment_prompt_tokens[-max_seq_len+50:]
+                    segment_prompt_tokens_mask = segment_prompt_tokens_mask[-max_seq_len+50:]
+                
+                # Generate audio for this segment
+                curr_tokens = segment_prompt_tokens.unsqueeze(0)
+                curr_tokens_mask = segment_prompt_tokens_mask.unsqueeze(0)
+                curr_pos = torch.arange(0, segment_prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
+                
+                # Generate segment
+                segment_samples = []
+                for start_idx in range(0, max_audio_frames, 32):
+                    end_idx = min(start_idx + 32, max_audio_frames)
+                    batch_frames = end_idx - start_idx
+                    samples_batch = []
+                    
+                    for i in range(batch_frames):
+                        sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+                        samples_batch.append(sample)
+                        
+                        if torch.all(sample == 0):
+                            break
+                        
+                        curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+                        curr_tokens_mask = torch.cat(
+                            [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                        ).unsqueeze(1)
+                        curr_pos = curr_pos[:, -1:] + 1
+                    
+                    segment_samples.extend(samples_batch)
+                    
+                    if len(samples_batch) < batch_frames:
+                        break
+                
+                if not segment_samples:
+                    logger.warning(f"No audio generated for segment {i+1}")
+                    continue
+                
+                # Decode segment
+                segment_audio = self._audio_tokenizer.decode(
+                    torch.stack(segment_samples).permute(1, 2, 0)
+                ).squeeze(0).squeeze(0)
+                
+                all_audio_segments.append(segment_audio)
             
-            # Add batch samples to all_samples
-            all_samples.extend(samples_batch)
+            # Combine all segments with small pauses
+            pause_samples = int(0.3 * self.sample_rate)  # 300ms pause
+            pause = torch.zeros(pause_samples, device=self.device)
             
-            # Check if we hit EOS and can stop early
-            if len(samples_batch) < batch_frames:
-                logger.info(f"Early stopping at frame {start_idx + len(samples_batch)}/{max_audio_frames}")
-                break
+            audio_parts = []
+            for i, segment_audio in enumerate(all_audio_segments):
+                audio_parts.append(segment_audio)
+                if i < len(all_audio_segments) - 1:
+                    audio_parts.append(pause)
+            
+            audio = torch.cat(audio_parts)
+            logger.info(f"Combined {len(all_audio_segments)} segments into final audio")
         
-        if not all_samples:
-            raise RuntimeError("No audio generated - model produced empty output")
+        else:
+            # For shorter text, standard processing
+            tokens, tokens_mask = [], []
             
-        # Decode audio
-        try:
+            # Add context segments
+            for segment in context:
+                segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
+                tokens.append(segment_tokens)
+                tokens_mask.append(segment_tokens_mask)
+            
+            # Process text
+            cleaned_text = clean_text_for_tts(text)
+            gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(cleaned_text, speaker)
+            tokens.append(gen_segment_tokens)
+            tokens_mask.append(gen_segment_tokens_mask)
+            
+            prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
+            prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
+            
+            # Check context size
+            if prompt_tokens.size(0) >= max_seq_len:
+                logger.warning(f"Inputs too long ({prompt_tokens.size(0)} tokens), truncating to {max_seq_len - 50}")
+                prompt_tokens = prompt_tokens[-max_seq_len+50:]
+                prompt_tokens_mask = prompt_tokens_mask[-max_seq_len+50:]
+            
+            # Generate audio - optimized batch generation
+            curr_tokens = prompt_tokens.unsqueeze(0)
+            curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
+            curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
+            
+            # Using optimized batch generation
+            batch_size = 32  # Generate this many frames at once 
+            all_samples = []
+            
+            for start_idx in range(0, max_audio_frames, batch_size):
+                end_idx = min(start_idx + batch_size, max_audio_frames)
+                batch_frames = end_idx - start_idx
+                
+                samples_batch = []
+                
+                for i in range(batch_frames):
+                    sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+                    samples_batch.append(sample)
+                    
+                    if torch.all(sample == 0):
+                        break
+                    
+                    curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+                    curr_tokens_mask = torch.cat(
+                        [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                    ).unsqueeze(1)
+                    curr_pos = curr_pos[:, -1:] + 1
+                
+                all_samples.extend(samples_batch)
+                
+                if len(samples_batch) < batch_frames:
+                    logger.info(f"Early stopping at frame {start_idx + len(samples_batch)}/{max_audio_frames}")
+                    break
+            
+            if not all_samples:
+                raise RuntimeError("No audio generated - model produced empty output")
+            
+            # Decode audio
             audio = self._audio_tokenizer.decode(torch.stack(all_samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
         
-            # Apply watermark
-            if self._watermarker is not None:
-                try:
-                    audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
-                    audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
-                except Exception as e:
-                    logger.warning(f"Error applying watermark: {e}. Continuing without watermark.")
-            
-            # Record execution time
-            end_time.record()
-            torch.cuda.synchronize()
-            execution_ms = start_time.elapsed_time(end_time)
-            audio_length_ms = (audio.shape[0] / self.sample_rate) * 1000
-            
-            # Calculate real-time factor (RTF)
-            rtf = execution_ms / audio_length_ms
-            logger.info(f"Audio generated in {execution_ms:.2f}ms, length: {audio_length_ms:.2f}ms, RTF: {rtf:.2f}x")
-            
-            return audio
-            
-        except Exception as e:
-            logger.error(f"Error decoding audio: {e}")
-            raise RuntimeError(f"Failed to decode audio: {e}")
+        # Apply watermark
+        if self._watermarker is not None:
+            try:
+                audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
+                audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+            except Exception as e:
+                logger.warning(f"Error applying watermark: {e}. Continuing without watermark.")
+        
+        # Record execution time
+        end_time.record()
+        torch.cuda.synchronize()
+        execution_ms = start_time.elapsed_time(end_time)
+        audio_length_ms = (audio.shape[0] / self.sample_rate) * 1000
+        
+        # Calculate real-time factor (RTF)
+        rtf = execution_ms / audio_length_ms
+        logger.info(f"Audio generated in {execution_ms:.2f}ms, length: {audio_length_ms:.2f}ms, RTF: {rtf:.2f}x")
+        
+        return audio
 
 # Define helper functions for multi-GPU support
 def _manual_device_map(model, state_dict, strategy="balanced"):

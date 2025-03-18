@@ -2,7 +2,7 @@
 FROM python:3.10-slim AS model-downloader
 
 # Install huggingface-cli
-RUN pip install --no-cache-dir huggingface_hub
+RUN pip install huggingface_hub
 
 # Set working directory
 WORKDIR /model-downloader
@@ -56,10 +56,10 @@ COPY ./static /app/static
 
 # Install Python dependencies
 RUN pip3 install --no-cache-dir --upgrade pip && \
-    pip3 install --no-cache-dir torch torchaudio numpy
+    pip3 install torch torchaudio numpy
 
 # Install torchao from source
-RUN pip3 install --no-cache-dir git+https://github.com/pytorch/ao.git
+RUN pip3 install git+https://github.com/pytorch/ao.git
 
 # Install torchtune from source with specific branch for latest features
 RUN git clone https://github.com/pytorch/torchtune.git /tmp/torchtune && \
@@ -69,7 +69,7 @@ RUN git clone https://github.com/pytorch/torchtune.git /tmp/torchtune && \
     pip install -e .
 
 # Install remaining dependencies
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install -r requirements.txt
 
 # Copy application code
 COPY ./app /app/app
