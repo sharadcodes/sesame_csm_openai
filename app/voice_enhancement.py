@@ -157,6 +157,46 @@ VOICE_PROMPTS = {
     ]
 }
 
+def initialize_voice_profiles():
+    """Initialize voice profiles with default settings.
+    
+    This function loads existing voice profiles from disk if available,
+    or initializes them with default settings.
+    """
+    global VOICE_PROFILES
+    
+    # Try to load existing profiles from disk
+    voice_profiles_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "voice_profiles")
+    os.makedirs(voice_profiles_dir, exist_ok=True)
+    profile_path = os.path.join(voice_profiles_dir, "voice_profiles.pt")
+    
+    if os.path.exists(profile_path):
+        try:
+            logger.info(f"Loading voice profiles from {profile_path}")
+            saved_profiles = torch.load(profile_path)
+            
+            # Update existing profiles with saved data
+            for name, data in saved_profiles.items():
+                if name in VOICE_PROFILES:
+                    VOICE_PROFILES[name].reference_segments = [
+                        seg.to(torch.device("cpu")) for seg in data.get('reference_segments', [])
+                    ]
+            
+            logger.info(f"Loaded voice profiles for {len(saved_profiles)} voices")
+        except Exception as e:
+            logger.error(f"Error loading voice profiles: {e}")
+            logger.info("Using default voice profiles")
+    else:
+        logger.info("No saved voice profiles found, using defaults")
+    
+    # Ensure all voices have at least empty reference segments
+    for name, profile in VOICE_PROFILES.items():
+        if not hasattr(profile, 'reference_segments'):
+            profile.reference_segments = []
+    
+    logger.info(f"Voice profiles initialized for {len(VOICE_PROFILES)} voices")
+    return VOICE_PROFILES
+
 def normalize_audio(audio: torch.Tensor, target_rms: float = 0.2, target_peak: float = 0.95) -> torch.Tensor:
     """Apply professional-grade normalization to audio.
     

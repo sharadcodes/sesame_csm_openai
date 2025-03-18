@@ -4,6 +4,7 @@ from typing import List, Tuple
 import torch
 import torchaudio
 import logging
+import os
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 from tokenizers.processors import TemplateProcessing
@@ -534,7 +535,7 @@ def _manual_device_map(model, state_dict, strategy="balanced"):
     return model
 
 def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: str = None) -> Generator:
-    """Load CSM-1B model and create generator.
+    """Load CSM-1B model and create generator with performance optimizations.
     
     Args:
         ckpt_path: Path to model checkpoint
@@ -542,7 +543,7 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: st
         device_map: Optional device mapping strategy ('auto', 'balanced', 'sequential', or None)
     
     Returns:
-        Generator instance
+        Generator instance with optimized settings
     """
     try:
         # Import models module for CSM
@@ -560,14 +561,48 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: st
         # Load model
         logger.info(f"Loading CSM-1B model from {ckpt_path} with device={device}, device_map={device_map}")
         
+        # Check for CUDA availability
+        cuda_available = device == "cuda" and torch.cuda.is_available()
+        
         # Set up torch for optimized inference
-        if device == "cuda" and torch.cuda.is_available():
-            # Use mixed precision for faster inference
-            dtype = torch.bfloat16
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+        if cuda_available:
+            # Check if we should enable TF32 (faster but slightly less precise)
+            enable_tf32 = os.environ.get("ENABLE_TF32", "true").lower() == "true"
+            if enable_tf32:
+                logger.info("Enabling TF32 for faster matrix multiplications")
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            
+            # Check for available precision modes
+            use_bfloat16 = torch.cuda.is_bf16_supported()
+            use_float16 = not use_bfloat16 and torch.cuda.is_available()  # Fallback to float16
+            
+            if use_bfloat16:
+                dtype = torch.bfloat16
+                logger.info("Using bfloat16 precision for faster inference")
+            elif use_float16:
+                dtype = torch.float16
+                logger.info("Using float16 precision for faster inference")
+            else:
+                dtype = torch.float32
+                logger.info("Using float32 precision (mixed precision not available)")
+            
+            # Enable Flash Attention if available
+            try:
+                import flash_attn
+                if os.environ.get("ENABLE_FLASH_ATTN", "true").lower() == "true":
+                    logger.info("Flash Attention detected - enabling for faster attention")
+                    os.environ["PYTORCH_FLASH_ATTENTION_ENABLED"] = "1"
+            except ImportError:
+                logger.info("Flash Attention not available (install flash-attn for faster inference)")
         else:
+            # CPU-only mode
             dtype = torch.float32
+            logger.info("Using CPU mode with float32 precision")
+        
+        # Check for quantization
+        enable_quantization = os.environ.get("ENABLE_QUANTIZATION", "false").lower() == "true"
+        is_quantized = False
         
         # Check for multi-GPU setup
         if device_map and torch.cuda.device_count() > 1:
@@ -578,6 +613,30 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: st
             
             # Load state dict
             state_dict = torch.load(ckpt_path, map_location='cpu')
+            
+            # Try quantization before device mapping if enabled
+            if enable_quantization and cuda_available:
+                try:
+                    from bitsandbytes.nn import Linear8bitLt
+                    
+                    def replace_with_8bit(model):
+                        """Replace linear layers with 8-bit quantized versions"""
+                        for name, module in model.named_modules():
+                            if isinstance(module, torch.nn.Linear) and module.out_features > 256:
+                                parent_name = name.rsplit('.', 1)[0] if '.' in name else ''
+                                parent = model
+                                if parent_name:
+                                    for attr in parent_name.split('.'):
+                                        parent = getattr(parent, attr)
+                                child_name = name.rsplit('.', 1)[1] if '.' in name else name
+                                setattr(parent, child_name, Linear8bitLt.from_float(module))
+                        return model
+                    
+                    logger.info("Applying 8-bit quantization to linear layers")
+                    model = replace_with_8bit(model)
+                    is_quantized = True
+                except ImportError:
+                    logger.warning("bitsandbytes not available, skipping quantization")
             
             # Apply device mapping
             if device_map == "auto":
@@ -594,26 +653,115 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: st
                         empty_model, 
                         ckpt_path, 
                         device_map="auto",
-                        no_split_module_classes=["TransformerLayer"]
+                        no_split_module_classes=["TransformerLayer"],
+                        # Offload CPU if very large model
+                        offload_folder="offload" if os.environ.get("OFFLOAD_TO_CPU", "false").lower() == "true" else None
                     )
                     logger.info("Model loaded with automatic device mapping")
                 except ImportError:
                     logger.warning("accelerate package not found, falling back to manual device mapping")
                     model = _manual_device_map(model, state_dict, "balanced")
+                except Exception as mapping_error:
+                    logger.error(f"Auto device mapping failed: {mapping_error}, falling back to manual")
+                    model = _manual_device_map(model, state_dict, "balanced")
             else:
                 # Manual device mapping
                 model = _manual_device_map(model, state_dict, device_map or "balanced")
         else:
-            # Single GPU or CPU
-            model = Model(model_args).to(device=device, dtype=dtype)
-            state_dict = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(state_dict)
+            # Single GPU or CPU setup
+            
+            # Try quantization before loading if enabled (GPU only)
+            if enable_quantization and cuda_available and not is_quantized:
+                try:
+                    # First load to CPU for quantization
+                    model = Model(model_args).to("cpu")
+                    state_dict = torch.load(ckpt_path, map_location="cpu")
+                    model.load_state_dict(state_dict)
+                    
+                    from bitsandbytes.nn import Linear8bitLt
+                    
+                    def replace_with_8bit(model):
+                        """Replace linear layers with 8-bit quantized versions"""
+                        for name, module in model.named_modules():
+                            if isinstance(module, torch.nn.Linear) and module.out_features > 256:
+                                parent_name = name.rsplit('.', 1)[0] if '.' in name else ''
+                                parent = model
+                                if parent_name:
+                                    for attr in parent_name.split('.'):
+                                        parent = getattr(parent, attr)
+                                child_name = name.rsplit('.', 1)[1] if '.' in name else name
+                                setattr(parent, child_name, Linear8bitLt.from_float(module))
+                        return model
+                    
+                    logger.info("Applying 8-bit quantization to linear layers")
+                    model = replace_with_8bit(model)
+                    model = model.to(device=device)
+                    is_quantized = True
+                except ImportError:
+                    logger.warning("bitsandbytes not available, loading without quantization")
+                    # Load the standard way
+                    model = Model(model_args).to(device=device, dtype=dtype)
+                    state_dict = torch.load(ckpt_path, map_location=device)
+                    model.load_state_dict(state_dict)
+                except Exception as quant_error:
+                    logger.error(f"Quantization failed: {quant_error}, loading without quantization")
+                    # Load the standard way
+                    model = Model(model_args).to(device=device, dtype=dtype)
+                    state_dict = torch.load(ckpt_path, map_location=device)
+                    model.load_state_dict(state_dict)
+            else:
+                # Standard load without quantization
+                model = Model(model_args).to(device=device, dtype=dtype)
+                state_dict = torch.load(ckpt_path, map_location=device)
+                model.load_state_dict(state_dict)
+        
+        # Apply torch.compile if available (PyTorch 2.0+)
+        compile_mode = os.environ.get("TORCH_COMPILE_MODE", "none")
+        if hasattr(torch, 'compile') and compile_mode != "none" and cuda_available:
+            try:
+                logger.info(f"Using torch.compile with mode '{compile_mode}' for faster inference")
+                if compile_mode == "default":
+                    model = torch.compile(model)
+                else:
+                    model = torch.compile(model, mode=compile_mode)
+            except Exception as compile_error:
+                logger.warning(f"Torch compile failed (requires PyTorch 2.0+): {compile_error}")
+        
+        # Try to optimize CUDA graphs for faster inference (advanced)
+        use_cuda_graphs = os.environ.get("USE_CUDA_GRAPHS", "false").lower() == "true"
+        if use_cuda_graphs and cuda_available and hasattr(torch.cuda, 'CUDAGraph'):
+            try:
+                logger.info("Setting up CUDA graphs for repeated inference patterns")
+                # This requires custom integration inside the model's forward method
+                # Just flagging that CUDA graphs should be used
+                model.use_cuda_graphs = True
+            except Exception as cuda_graph_error:
+                logger.warning(f"CUDA graphs setup failed: {cuda_graph_error}")
+                model.use_cuda_graphs = False
+        
+        # Set optimal settings for CUDA context
+        if cuda_available:
+            # Set benchmark mode for hardware-specific optimizations
+            torch.backends.cudnn.benchmark = True
+            # Clean up CUDA cache before creating generator
+            torch.cuda.empty_cache()
+            # Ensure all CUDA work is completed to avoid launch delays
+            torch.cuda.synchronize()
         
         # Create generator
-        logger.info("Creating generator")
+        logger.info("Creating generator with optimized settings")
         generator = Generator(model)
-        logger.info("Generator created successfully")
+        
+        # Log memory usage if on CUDA
+        if cuda_available:
+            memory_allocated = torch.cuda.memory_allocated() / (1024**3)
+            memory_reserved = torch.cuda.memory_reserved() / (1024**3)
+            logger.info(f"Model loaded, CUDA memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
+        
+        logger.info(f"Generator created successfully: precision={dtype}, quantized={is_quantized}")
         return generator
     except Exception as e:
         logger.error(f"Failed to load CSM-1B model: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise
