@@ -1,4 +1,4 @@
-# Updated generator.py with batch generation
+# Updated generator.py with proper function order
 from dataclasses import dataclass
 from typing import List, Tuple
 import torch
@@ -95,7 +95,6 @@ class Generator:
             self.sample_rate = 24000  # Default sample rate
             logger.warning(f"Using fallback sample rate: {self.sample_rate}")
             raise RuntimeError(f"Failed to load Mimi codec: {e}")
-
         try:
             self._watermarker = load_watermarker(device=device)
             logger.info("Watermarker loaded successfully")
@@ -124,14 +123,14 @@ class Generator:
         frame_tokens.append(text_frame.to(self.device))
         frame_masks.append(text_frame_mask.to(self.device))
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
-
+    
     def _clean_text_input(self, text: str) -> str:
         """Remove any voice instructions in square brackets to prevent them being read aloud."""
         import re
         # Fix the regex pattern to properly match and remove text in square brackets
         text = re.sub(r'\[.*?\]', '', text)
         return text
-
+    
     def _tokenize_audio(self, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize audio."""
         if self._audio_tokenizer is None:
@@ -151,13 +150,13 @@ class Generator:
         frame_tokens.append(audio_frame)
         frame_masks.append(audio_frame_mask)
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
-
+    
     def _tokenize_segment(self, segment: Segment) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize a segment of text and audio."""
         text_tokens, text_masks = self._tokenize_text_segment(segment.text, segment.speaker)
         audio_tokens, audio_masks = self._tokenize_audio(segment.audio)
         return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
-
+    
     @torch.inference_mode()
     def generate(
         self,
@@ -279,8 +278,123 @@ class Generator:
             logger.error(f"Error decoding audio: {e}")
             raise RuntimeError(f"Failed to decode audio: {e}")
 
-def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
-    """Load CSM-1B model and create generator."""
+# Define helper functions for multi-GPU support
+def _manual_device_map(model, state_dict, strategy="balanced"):
+    """Apply manual device mapping for multi-GPU setups.
+    
+    Args:
+        model: The model to map
+        state_dict: Model state dict
+        strategy: Mapping strategy ('balanced', 'sequential')
+        
+    Returns:
+        Model with weights distributed across GPUs
+    """
+    num_gpus = torch.cuda.device_count()
+    if num_gpus <= 1:
+        # No need for mapping with single GPU
+        model.load_state_dict(state_dict)
+        model = model.to("cuda")
+        return model
+    
+    logger.info(f"Applying manual {strategy} device mapping across {num_gpus} GPUs")
+    
+    # Get all layer names from state dict
+    layer_names = [name for name in state_dict.keys() if "layers" in name]
+    backbone_layers = [name for name in layer_names if "backbone.layers" in name]
+    decoder_layers = [name for name in layer_names if "decoder.layers" in name]
+    
+    # Count number of backbone and decoder layers
+    backbone_layer_indices = set()
+    for name in backbone_layers:
+        parts = name.split('.')
+        if len(parts) > 2:
+            try:
+                backbone_layer_indices.add(int(parts[2]))
+            except ValueError:
+                pass
+    
+    decoder_layer_indices = set()
+    for name in decoder_layers:
+        parts = name.split('.')
+        if len(parts) > 2:
+            try:
+                decoder_layer_indices.add(int(parts[2]))
+            except ValueError:
+                pass
+    
+    num_backbone_layers = len(backbone_layer_indices)
+    num_decoder_layers = len(decoder_layer_indices)
+    
+    # Create device map
+    device_map = {}
+    
+    if strategy == "balanced":
+        # Distribute layers evenly across GPUs
+        layers_per_gpu = (num_backbone_layers + num_decoder_layers) // num_gpus
+        remainder = (num_backbone_layers + num_decoder_layers) % num_gpus
+        
+        # Assign backbone layers
+        for i in backbone_layer_indices:
+            gpu_idx = min(i // layers_per_gpu, num_gpus - 1)
+            device_map[f"backbone.layers.{i}"] = f"cuda:{gpu_idx}"
+        
+        # Assign decoder layers
+        for i in decoder_layer_indices:
+            gpu_idx = min((i + num_backbone_layers) // layers_per_gpu, num_gpus - 1)
+            device_map[f"decoder.layers.{i}"] = f"cuda:{gpu_idx}"
+            
+    elif strategy == "sequential":
+        # Fill each GPU sequentially
+        # Backbone layers on first GPU(s)
+        backbone_per_gpu = max(1, num_backbone_layers // ((num_gpus + 1) // 2))
+        for i in backbone_layer_indices:
+            gpu_idx = min(i // backbone_per_gpu, (num_gpus + 1) // 2 - 1)
+            device_map[f"backbone.layers.{i}"] = f"cuda:{gpu_idx}"
+        
+        # Decoder layers on remaining GPU(s)
+        decoder_per_gpu = max(1, num_decoder_layers // (num_gpus - (num_gpus + 1) // 2 + 1))
+        for i in decoder_layer_indices:
+            gpu_idx = min(i // decoder_per_gpu + (num_gpus + 1) // 2 - 1, num_gpus - 1)
+            device_map[f"decoder.layers.{i}"] = f"cuda:{gpu_idx}"
+    
+    # Assign embeddings and other components
+    device_map["text_embeddings"] = "cuda:0"
+    device_map["audio_embeddings"] = "cuda:0"
+    device_map["projection"] = "cuda:0"
+    device_map["codebook0_head"] = "cuda:0"
+    device_map["audio_head"] = "cuda:0"
+    
+    # Load state dict with device mapping
+    model.load_state_dict(state_dict)
+    
+    # Move model parts to assigned devices
+    for name, device in device_map.items():
+        if "backbone.layers" in name:
+            layer_idx = int(name.split('.')[-1])
+            if hasattr(model.backbone, 'layers') and layer_idx < len(model.backbone.layers):
+                model.backbone.layers[layer_idx] = model.backbone.layers[layer_idx].to(device)
+        elif "decoder.layers" in name:
+            layer_idx = int(name.split('.')[-1])
+            if hasattr(model.decoder, 'layers') and layer_idx < len(model.decoder.layers):
+                model.decoder.layers[layer_idx] = model.decoder.layers[layer_idx].to(device)
+        elif hasattr(model, name):
+            setattr(model, name, getattr(model, name).to(device))
+    
+    logger.info(f"Model distributed across GPUs with {strategy} strategy")
+    return model
+
+def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: str = None) -> Generator:
+    """Load CSM-1B model and create generator.
+    
+    Args:
+        ckpt_path: Path to model checkpoint
+        device: Device to load model on ('cuda', 'cpu', or specific CUDA device)
+        device_map: Optional device mapping strategy ('auto', 'balanced', 'sequential', or None)
+    
+    Returns:
+        Generator instance
+    """
     try:
         # Import models module for CSM
         from app.torchtune_models import Model, ModelArgs
@@ -295,7 +409,7 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
         )
         
         # Load model
-        logger.info(f"Loading CSM-1B model from {ckpt_path} to {device}")
+        logger.info(f"Loading CSM-1B model from {ckpt_path} with device={device}, device_map={device_map}")
         
         # Set up torch for optimized inference
         if device == "cuda" and torch.cuda.is_available():
@@ -305,16 +419,51 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
             torch.backends.cudnn.allow_tf32 = True
         else:
             dtype = torch.float32
+        
+        # Check for multi-GPU setup
+        if device_map and torch.cuda.device_count() > 1:
+            logger.info(f"Using device_map={device_map} across {torch.cuda.device_count()} GPUs")
             
-        model = Model(model_args).to(device=device, dtype=dtype)
-        state_dict = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(state_dict)
+            # Create model with device map
+            model = Model(model_args)
+            
+            # Load state dict
+            state_dict = torch.load(ckpt_path, map_location='cpu')
+            
+            # Apply device mapping
+            if device_map == "auto":
+                # Use accelerate for automatic device mapping
+                try:
+                    from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+                    
+                    # Initialize empty model
+                    with init_empty_weights():
+                        empty_model = Model(model_args)
+                    
+                    # Load and dispatch model across GPUs
+                    model = load_checkpoint_and_dispatch(
+                        empty_model, 
+                        ckpt_path, 
+                        device_map="auto",
+                        no_split_module_classes=["TransformerLayer"]
+                    )
+                    logger.info("Model loaded with automatic device mapping")
+                except ImportError:
+                    logger.warning("accelerate package not found, falling back to manual device mapping")
+                    model = _manual_device_map(model, state_dict, "balanced")
+            else:
+                # Manual device mapping
+                model = _manual_device_map(model, state_dict, device_map or "balanced")
+        else:
+            # Single GPU or CPU
+            model = Model(model_args).to(device=device, dtype=dtype)
+            state_dict = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(state_dict)
         
         # Create generator
         logger.info("Creating generator")
         generator = Generator(model)
         logger.info("Generator created successfully")
-        
         return generator
     except Exception as e:
         logger.error(f"Failed to load CSM-1B model: {e}")

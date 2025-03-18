@@ -63,6 +63,20 @@ The API uses the following models which are downloaded automatically:
 - **Mimi**: Audio codec for high-quality audio generation
 - **Llama Tokenizer**: Uses the unsloth/Llama-3.2-1B tokenizer for text processing
 
+## Multi-GPU Support
+
+The CSM-1B model can be distributed across multiple GPUs to handle larger models or improve performance. To enable multi-GPU support, set the `CSM_DEVICE_MAP` environment variable:
+
+```bash
+# Automatic device mapping (recommended)
+CSM_DEVICE_MAP=auto docker compose up -d
+
+# Balanced distribution of layers across GPUs
+CSM_DEVICE_MAP=balanced docker compose up -d
+
+# Sequential distribution (backbone on first GPUs, decoder on remaining)
+CSM_DEVICE_MAP=sequential docker compose up -d
+
 ## Voice Cloning Guide
 
 The CSM-1B TTS API comes with powerful voice cloning capabilities that allow you to create custom voices from audio samples. Here's how to use this feature:
