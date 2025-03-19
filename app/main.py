@@ -11,6 +11,7 @@ import traceback
 import asyncio
 import torch
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, FileResponse
@@ -37,46 +38,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logger.info("Starting CSM-1B TTS API")
-# Initialize FastAPI app
-app = FastAPI(
-    title="CSM-1B TTS API",
-    description="OpenAI-compatible TTS API using the CSM-1B model from Sesame",
-    version="1.0.0"
-)
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# Create static and other required directories
-os.makedirs("static", exist_ok=True)
-os.makedirs("cloned_voices", exist_ok=True)
-# Mount the static files directory
-app.mount("/static", StaticFiles(directory="static"), name="static")
-# Include routers
-app.include_router(api_router, prefix="/api/v1")
-# Add OpenAI compatible route
-app.include_router(api_router, prefix="/v1")
-# Add voice cloning routes
-from app.api.voice_cloning_routes import router as voice_cloning_router
-app.include_router(voice_cloning_router, prefix="/api/v1")
-app.include_router(voice_cloning_router, prefix="/v1")
-# Middleware for request timing
-@app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    """Middleware to track request processing time."""
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    response.headers["X-Process-Time"] = str(process_time)
-    logger.debug(f"Request to {request.url.path} processed in {process_time:.3f} seconds")
-    return response
-@app.on_event("startup")
-async def startup_event():
-    """Application startup event that loads the model and initializes voices."""
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager for startup and shutdown events."""
+    # STARTUP EVENT
     logger.info("Starting application initialization")
     
     app.state.startup_time = time.time()
@@ -166,7 +132,6 @@ async def startup_event():
             logger.error(f"Error downloading model: {str(e)}\n{error_stack}")
             logger.error("Please build the image with HF_TOKEN to download the model")
             logger.error("Starting without model - API will return 503 Service Unavailable")
-            return
     else:
         logger.info(f"Found existing model at {model_path}")
         logger.info(f"Model size: {os.path.getsize(model_path) / (1024 * 1024):.2f} MB")
@@ -275,9 +240,9 @@ async def startup_event():
     startup_time = time.time() - app.state.startup_time
     logger.info(f"Application startup completed in {startup_time:.2f} seconds")
     
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Application shutdown event that cleans up resources."""
+    yield  # This is where the application runs
+    
+    # SHUTDOWN EVENT
     logger.info("Application shutdown initiated")
     
     # Clean up model resources
@@ -301,6 +266,48 @@ async def shutdown_event():
         logger.error(f"Error saving voice profiles: {e}")
     
     logger.info("Application shutdown complete")
+    
+# Initialize FastAPI app
+app = FastAPI(
+    title="CSM-1B TTS API",
+    description="OpenAI-compatible TTS API using the CSM-1B model from Sesame",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Create static and other required directories
+os.makedirs("static", exist_ok=True)
+os.makedirs("cloned_voices", exist_ok=True)
+# Mount the static files directory
+app.mount("/static", StaticFiles(directory="static"), name="static")
+# Include routers
+app.include_router(api_router, prefix="/api/v1")
+# Add OpenAI compatible route
+app.include_router(api_router, prefix="/v1")
+# Add voice cloning routes
+from app.api.voice_cloning_routes import router as voice_cloning_router
+app.include_router(voice_cloning_router, prefix="/api/v1")
+app.include_router(voice_cloning_router, prefix="/v1")
+# Middleware for request timing
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    """Middleware to track request processing time."""
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    logger.debug(f"Request to {request.url.path} processed in {process_time:.3f} seconds")
+    return response
+
 # Health check endpoint
 @app.get("/health", include_in_schema=False)
 async def health_check():
