@@ -176,6 +176,100 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output cloned_speech.mp3
 ```
 
+# YouTube Voice Cloning with CSM-1B TTS API
+
+## Overview
+
+The CSM-1B TTS API now includes the ability to clone voices directly from YouTube videos. This feature allows you to extract voice characteristics from any YouTube content and create custom TTS voices without needing to download or prepare audio samples yourself.
+
+## How to Clone a Voice from YouTube
+
+### API Endpoint
+
+```
+POST /v1/audio/speech/voice-cloning/youtube
+```
+
+Parameters:
+- `youtube_url`: URL of the YouTube video
+- `voice_name`: Name for the cloned voice
+- `start_time` (optional): Start time in seconds (default: 0)
+- `duration` (optional): Duration to extract in seconds (default: 180)
+- `description` (optional): Description of the voice
+
+Example request:
+```json
+{
+  "youtube_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  "voice_name": "rick_astley",
+  "start_time": 30,
+  "duration": 60,
+  "description": "Never gonna give you up"
+}
+```
+
+Response:
+```json
+{
+  "voice_id": "1710805983_rick_astley",
+  "name": "rick_astley",
+  "description": "Never gonna give you up",
+  "created_at": "2025-03-18T22:53:03Z",
+  "audio_duration": 60.0,
+  "sample_count": 1440000
+}
+```
+
+## How It Works
+
+1. The system downloads the audio from the specified YouTube video
+2. It extracts the specified segment (start time and duration)
+3. Whisper ASR generates a transcript of the audio for better voice matching
+4. The audio is processed to remove noise and silence
+5. The voice is cloned and made available for TTS generation
+
+## Best Practices for YouTube Voice Cloning
+
+For optimal results:
+
+1. **Choose Clear Speech Segments**
+   - Select portions of the video with clear, uninterrupted speech
+   - Avoid segments with background music, sound effects, or multiple speakers
+
+2. **Optimal Duration**
+   - 30-60 seconds of clean speech typically provides the best results
+   - Longer isn't always better - quality matters more than quantity
+
+3. **Specify Time Ranges Precisely**
+   - Use `start_time` and `duration` to target the exact speech segment
+   - Preview the segment in YouTube before cloning to ensure it's suitable
+
+4. **Consider Audio Quality**
+   - Higher quality videos generally produce better voice clones
+   - Interviews, vlogs, and speeches often work better than highly produced content
+
+## Limitations
+
+- YouTube videos with heavy background music may result in lower quality voice clones
+- Very noisy or low-quality audio sources will produce less accurate voice clones
+- The system works best with natural speech rather than singing or exaggerated voices
+- Copyright restrictions apply - only clone voices you have permission to use
+
+## Example Use Cases
+
+- Create a voice clone of a public figure for educational content
+- Clone your own YouTube voice for consistent TTS across your applications
+- Create voice clones from historical speeches or interviews (public domain)
+- Develop custom voices for creative projects with proper permissions
+
+## Ethical Considerations
+
+Please use YouTube voice cloning responsibly:
+- Only clone voices from content you have permission to use
+- Respect copyright and intellectual property rights
+- Clearly disclose when using AI-generated or cloned voices
+- Do not use cloned voices for impersonation, deception, or harmful content
+
 ## How the Voices Work
 
 Unlike traditional TTS systems with pre-trained voice models, CSM-1B works differently:
