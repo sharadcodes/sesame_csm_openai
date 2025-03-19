@@ -176,9 +176,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output cloned_speech.mp3
 ```
 
-# YouTube Voice Cloning with CSM-1B TTS API
-
-## Overview
+## YouTube Voice Cloning 
 
 The CSM-1B TTS API now includes the ability to clone voices directly from YouTube videos. This feature allows you to extract voice characteristics from any YouTube content and create custom TTS voices without needing to download or prepare audio samples yourself.
 
