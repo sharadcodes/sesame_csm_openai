@@ -42,7 +42,7 @@ docker compose up -d --build
 
 The server will start on port 8000. First startup may take some time as it downloads the model files.
 
-## Hugging Face Configuration
+## Hugging Face Configuration (ONLY NEEDED TO ACCEPT TERMS/DOWNLOAD MODEL)
 
 This API requires access to the `sesame/csm-1b` model on Hugging Face:
 
