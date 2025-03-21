@@ -492,54 +492,29 @@ async def conversation_to_speech(
 @router.get("/audio/voices")
 async def list_voices(request: Request):
     """
-    List available voices.
+    List available voices in a format compatible with OpenAI and OpenWebUI.
     """
-    # Standard voices with their descriptions
-    standard_voices = [
-        {
-            "voice_id": "alloy",
-            "name": "Alloy",
-            "description": "Balanced and versatile, suitable for a wide range of content."
-        },
-        {
-            "voice_id": "echo",
-            "name": "Echo",
-            "description": "Resonant and full-bodied with a touch of reverberance."
-        },
-        {
-            "voice_id": "fable",
-            "name": "Fable",
-            "description": "Brighter and higher-pitched, good for narration and storytelling."
-        },
-        {
-            "voice_id": "onyx",
-            "name": "Onyx",
-            "description": "Deep and authoritative with a rich, powerful tone."
-        },
-        {
-            "voice_id": "nova",
-            "name": "Nova",
-            "description": "Warm and smooth, creating a calming, pleasant impression."
-        },
-        {
-            "voice_id": "shimmer",
-            "name": "Shimmer",
-            "description": "Light and airy with higher frequencies, good for lively content."
-        }
+    # Standard voices
+    voices = [
+        {"voice_id": "alloy", "name": "Alloy"},
+        {"voice_id": "echo", "name": "Echo"},
+        {"voice_id": "fable", "name": "Fable"},
+        {"voice_id": "onyx", "name": "Onyx"},
+        {"voice_id": "nova", "name": "Nova"},
+        {"voice_id": "shimmer", "name": "Shimmer"}
     ]
     
     # Add cloned voices if available
     if hasattr(request.app.state, "voice_cloner") and request.app.state.voice_cloner is not None:
-        voice_cloner = request.app.state.voice_cloner
-        for voice_id, voice in voice_cloner.cloned_voices.items():
-            cloned_voice = {
-                "voice_id": voice_id,
-                "name": voice.name,
-                "description": voice.description or f"Cloned voice: {voice.name}"
-            }
-            standard_voices.append(cloned_voice)
+        cloned_voices = request.app.state.voice_cloner.list_voices()
+        for voice in cloned_voices:
+            voices.append({
+                "voice_id": voice.id,  # This has to be specifically voice_id
+                "name": voice.name     # This has to be specifically name
+            })
     
-    return {"voices": standard_voices}
+    logger.info(f"Listing {len(voices)} voices: {[v['name'] for v in voices]}")
+    return {"voices": voices}
 
 # Add OpenAI-compatible models list endpoint
 @router.get("/audio/models", summary="List available audio models")
