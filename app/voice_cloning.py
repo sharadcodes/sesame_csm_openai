@@ -605,7 +605,7 @@ class VoiceCloner:
         
         return result["text"]
 
-    async def generate_speech(
+    def generate_speech(
         self,
         text: str,
         voice_id: str,
@@ -615,23 +615,22 @@ class VoiceCloner:
     ) -> torch.Tensor:
         """
         Generate speech with a cloned voice.
-        
         Args:
             text: Text to synthesize
             voice_id: ID of the cloned voice to use
             temperature: Sampling temperature (lower = more stable, higher = more varied)
             topk: Top-k sampling parameter
             max_audio_length_ms: Maximum audio length in milliseconds
-            
         Returns:
             Generated audio tensor
         """
+        # Remove any async/await keywords
+        
         if voice_id not in self.cloned_voices:
             raise ValueError(f"Voice ID {voice_id} not found")
         
         voice = self.cloned_voices[voice_id]
         context = self.get_voice_context(voice_id)
-        
         if not context:
             raise ValueError(f"Could not get context for voice {voice_id}")
         
@@ -643,19 +642,14 @@ class VoiceCloner:
             # Check if text is too long and should be split
             if len(processed_text) > 200:
                 logger.info(f"Text is long ({len(processed_text)} chars), splitting for better quality")
-                
                 from app.prompt_engineering import split_into_segments
-                
                 # Split text into manageable segments
                 segments = split_into_segments(processed_text, max_chars=150)
                 logger.info(f"Split text into {len(segments)} segments")
-                
                 all_audio_chunks = []
-                
                 # Process each segment
                 for i, segment_text in enumerate(segments):
                     logger.info(f"Generating segment {i+1}/{len(segments)}")
-                    
                     # Generate this segment - using plain text without formatting
                     segment_audio = self.generator.generate(
                         text=segment_text,  # Use plain text, no formatting
@@ -665,9 +659,7 @@ class VoiceCloner:
                         temperature=temperature,
                         topk=topk,
                     )
-                    
                     all_audio_chunks.append(segment_audio)
-                    
                     # Use this segment as context for the next one for consistency
                     if i < len(segments) - 1:
                         context = [
@@ -677,26 +669,21 @@ class VoiceCloner:
                                 audio=segment_audio
                             )
                         ]
-                
                 # Combine chunks with small silence between them
                 if len(all_audio_chunks) == 1:
                     audio = all_audio_chunks[0]
                 else:
                     silence_samples = int(0.1 * self.sample_rate)  # 100ms silence
                     silence = torch.zeros(silence_samples, device=all_audio_chunks[0].device)
-                    
                     # Join segments with silence
                     audio_parts = []
                     for i, chunk in enumerate(all_audio_chunks):
                         audio_parts.append(chunk)
                         if i < len(all_audio_chunks) - 1:  # Don't add silence after the last chunk
                             audio_parts.append(silence)
-                            
                     # Concatenate all parts
                     audio = torch.cat(audio_parts)
-                    
                 return audio
-                
             else:
                 # For short text, generate directly - using plain text without formatting
                 audio = self.generator.generate(
@@ -707,9 +694,7 @@ class VoiceCloner:
                     temperature=temperature,
                     topk=topk,
                 )
-                
                 return audio
-                
         except Exception as e:
             logger.error(f"Error generating speech with voice {voice_id}: {e}")
             raise

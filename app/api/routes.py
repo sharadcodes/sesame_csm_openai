@@ -7,6 +7,7 @@ import base64
 import time
 import tempfile
 import logging
+from enum import Enum
 from typing import Dict, List, Optional, Any, Union
 
 import torch
@@ -32,249 +33,345 @@ MIME_TYPES = {
     "wav": "audio/wav",
 }
 
-@router.post("/audio/speech", summary="Generate speech from text")
+@router.post("/audio/speech", response_class=Response)
 async def text_to_speech(
     request: Request,
-    background_tasks: BackgroundTasks,
-    body: Dict[str, Any] = Body(...),
+    tts_request: TTSRequest,
 ):
     """
-    OpenAI compatible TTS endpoint that generates speech from text using the CSM-1B model.
+    TextToSpeech API compatible with OpenAI TTS API.
     """
-    # Get generator from app state
-    generator = request.app.state.generator
+    # Check if model is available
+    if not hasattr(request.app.state, "generator") or request.app.state.generator is None:
+        raise HTTPException(status_code=503, detail="TTS model not available")
     
-    # Validate model availability
-    if generator is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    # Set default values
+    model = tts_request.model
+    voice = tts_request.voice
+    input_text = tts_request.input
+    response_format = tts_request.response_format.value if isinstance(tts_request.response_format, Enum) else tts_request.response_format
+    speed = tts_request.speed
+    temperature = tts_request.temperature
+    max_audio_length_ms = tts_request.max_audio_length_ms
     
-    # Start timing
-    start_time = time.time()
+    # Log request details
+    logger.info(f"TTS request: text length={len(input_text)}, voice={voice}, format={response_format}")
     
-    # Extract parameters with fallbacks
-    text = body.get("input", "")
-    if not text:
-        # Try 'text' as an alternative to 'input'
-        text = body.get("text", "")
-    if not text:
-        raise HTTPException(status_code=400, detail="Missing 'input' field in request")
+    # Standard voices
+    standard_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
     
-    # Handle voice parameter
-    voice_name = body.get("voice", "alloy")
+    # Check if the requested voice is a cloned voice
+    cloned_voice_id = None
+    voice_cloner = None if not hasattr(request.app.state, "voice_cloner") else request.app.state.voice_cloner
     
-    # Convert string voice name to speaker ID
-    try:
-        if voice_name in ["0", "1", "2", "3", "4", "5"]:
-            # Already a numeric string
-            speaker = int(voice_name)
-            voice_name = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"][speaker]
-            cloned_voice_id = None
-        elif voice_name in ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]:
-            # Convert named voice to speaker ID
-            voice_map = {
-                "alloy": 0, 
-                "echo": 1, 
-                "fable": 2, 
-                "onyx": 3, 
-                "nova": 4, 
-                "shimmer": 5
-            }
-            speaker = voice_map[voice_name]
-            cloned_voice_id = None
+    # First, determine if we need to use a cloned voice
+    if voice_cloner is not None and voice not in standard_voices:
+        # Check directly by ID
+        if voice in voice_cloner.cloned_voices:
+            cloned_voice_id = voice
+            logger.info(f"Using cloned voice with ID: {cloned_voice_id}")
         else:
-            # Check if this is a cloned voice
-            cloned_voice_id = None
-            if hasattr(request.app.state, "voice_cloner"):
-                # Check if the voice name is a cloned voice ID
-                voice_cloner = request.app.state.voice_cloner
-                if voice_name in voice_cloner.cloned_voices:
-                    cloned_voice_id = voice_name
-                    speaker = voice_cloner.cloned_voices[voice_name].speaker_id
-                    logger.info(f"Using cloned voice: {voice_name} with speaker ID: {speaker}")
-                else:
-                    # Check if the voice name matches a cloned voice name
-                    for voice_id, voice in voice_cloner.cloned_voices.items():
-                        if voice.name.lower() == voice_name.lower():
-                            cloned_voice_id = voice_id
-                            speaker = voice.speaker_id
-                            logger.info(f"Found cloned voice by name: {voice_name} (ID: {cloned_voice_id})")
-                            break
+            # Try to find by name
+            for v_id, v_info in voice_cloner.cloned_voices.items():
+                if v_info.name.lower() == voice.lower() or v_info.name.lower().replace(' ', '_') == voice.lower():
+                    cloned_voice_id = v_id
+                    logger.info(f"Found cloned voice '{v_info.name}' with ID: {cloned_voice_id}")
+                    break
             
-            # Default to speaker 0 if not found
-            if 'speaker' not in locals():
-                logger.warning(f"Unknown voice '{voice_name}', defaulting to speaker 0")
-                speaker = 0
-                voice_name = "alloy"
+            # Also check by speaker_id (as a string, since it might be passed that way)
+            if cloned_voice_id is None:
+                try:
+                    for v_id, v_info in voice_cloner.cloned_voices.items():
+                        if str(v_info.speaker_id) == str(voice):
+                            cloned_voice_id = v_id
+                            logger.info(f"Found cloned voice by speaker_id {voice} with ID: {cloned_voice_id}")
+                            break
+                except:
+                    pass
+    
+    try:
+        # Generate audio based on whether it's a standard or cloned voice
+        if cloned_voice_id is not None and voice_cloner is not None:
+            # Generate speech with cloned voice
+            logger.info(f"Generating speech with cloned voice ID: {cloned_voice_id}")
+            try:
+                audio = voice_cloner.generate_speech(
+                    text=input_text,
+                    voice_id=cloned_voice_id,
+                    temperature=temperature,
+                    topk=tts_request.topk or 30,
+                    max_audio_length_ms=max_audio_length_ms
+                )
+                sample_rate = request.app.state.sample_rate
+                logger.info(f"Generated speech with cloned voice, length: {len(audio)/sample_rate:.2f}s")
+            except Exception as e:
+                logger.error(f"Error generating speech with cloned voice: {e}", exc_info=True)
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Failed to generate speech with cloned voice: {str(e)}"
+                )
+        else:
+            # Generate speech with standard voice
+            # Map voice name to speaker ID for standard voices
+            voice_to_speaker = {"alloy": 0, "echo": 1, "fable": 2, "onyx": 3, "nova": 4, "shimmer": 5}
+            
+            if voice in voice_to_speaker:
+                speaker_id = voice_to_speaker[voice]
+            else:
+                try:
+                    # Try to parse as integer directly
+                    speaker_id = int(voice)
+                    if speaker_id not in range(6):
+                        speaker_id = 0  # Default to alloy if out of range
+                except (ValueError, TypeError):
+                    speaker_id = 0  # Default to alloy if parsing fails
+            
+            # Check for voice context from memory
+            if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
+                from app.voice_memory import get_voice_context
+                context = get_voice_context(voice, torch.device(request.app.state.device))
+            else:
+                context = []
+            
+            # Generate audio
+            audio = request.app.state.generator.generate(
+                text=input_text,
+                speaker=speaker_id,
+                context=context,
+                temperature=temperature,
+                topk=tts_request.topk or 50,
+                max_audio_length_ms=max_audio_length_ms
+            )
+            sample_rate = request.app.state.sample_rate
+            
+            # Update voice memory if enabled
+            if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
+                from app.voice_memory import update_voice_memory
+                update_voice_memory(voice, audio, input_text)
+        
+        # Handle speed adjustments if not 1.0
+        if speed != 1.0 and speed > 0:
+            try:
+                import torchaudio
+                # Adjust speed using torchaudio
+                effects = [
+                    ["tempo", str(speed)]
+                ]
+                audio_cpu = audio.cpu()
+                adjusted_audio, _ = torchaudio.sox_effects.apply_effects_tensor(
+                    audio_cpu.unsqueeze(0), 
+                    sample_rate, 
+                    effects
+                )
+                audio = adjusted_audio.squeeze(0)
+                logger.info(f"Adjusted speech speed to {speed}x")
+            except Exception as e:
+                logger.warning(f"Failed to adjust speech speed: {e}")
+        
+        # Format the audio according to the requested format
+        response_data, content_type = await format_audio(
+            audio, 
+            response_format, 
+            sample_rate, 
+            request.app.state
+        )
+        
+        # Create and return the response
+        return Response(
+            content=response_data,
+            media_type=content_type,
+            headers={"Content-Disposition": f"attachment; filename=speech.{response_format}"}
+        )
+                
     except Exception as e:
-        logger.error(f"Error processing voice parameter: {e}")
-        speaker = 0
-        voice_name = "alloy"
-        cloned_voice_id = None
+        logger.error(f"Error in text_to_speech: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def format_audio(audio, response_format, sample_rate, app_state):
+    """
+    Format audio according to requested format.
     
-    # Handle other parameters
-    response_format = body.get("response_format", "mp3")
-    speed = float(body.get("speed", 1.0))
-    max_audio_length_ms = float(body.get("max_audio_length_ms", 90000))
-    temperature = float(body.get("temperature", 0.7))  # Lower default for faster, more stable output
-    topk = int(body.get("topk", 50))
+    Args:
+        audio: Audio tensor from TTS generation
+        response_format: Format as string or enum ('mp3', 'opus', 'aac', 'flac', 'wav')
+        sample_rate: Sample rate of the audio
+        app_state: FastAPI app state with config and cache settings
     
-    # MIME types mapping
-    MIME_TYPES = {
-        "mp3": "audio/mpeg",
-        "wav": "audio/wav",
-        "opus": "audio/opus",
-        "aac": "audio/aac",
-        "flac": "audio/flac",
+    Returns:
+        Tuple of (response_data, content_type)
+    """
+    import io
+    import torch
+    import torchaudio
+    import tempfile
+    import os
+    import hashlib
+    import time
+    
+    # Handle enum or string for response_format
+    if hasattr(response_format, 'value'):
+        response_format = response_format.value
+    
+    # Normalize response_format to lowercase
+    response_format = str(response_format).lower()
+    
+    # Map formats to content types
+    format_to_content_type = {
+        'mp3': 'audio/mpeg',
+        'opus': 'audio/opus',
+        'aac': 'audio/aac',
+        'flac': 'audio/flac',
+        'wav': 'audio/wav'
     }
     
-    # Generate audio
-    try:
-        logger.info(f"Generating audio for: '{text[:100]}...' with voice={voice_name} (speaker={speaker})")
+    # Ensure response format is supported
+    if response_format not in format_to_content_type:
+        logger.warning(f"Unsupported format: {response_format}, defaulting to mp3")
+        response_format = 'mp3'
+    
+    # Generate a cache key based on audio content and format
+    cache_enabled = getattr(app_state, "audio_cache_enabled", False)
+    cache_key = None
+    
+    if cache_enabled:
+        # Generate a hash of the audio tensor for caching
+        audio_hash = hashlib.md5(audio.cpu().numpy().tobytes()).hexdigest()
+        cache_key = f"{audio_hash}_{response_format}"
+        cache_dir = getattr(app_state, "audio_cache_dir", "audio_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, f"{cache_key}")
         
-        # Get voice context for consistent output
-        # This is important for voice quality - don't skip!
-        if hasattr(request.app.state, "voice_memory") and voice_name in request.app.state.voice_memory:
-            context = request.app.state.voice_memory[voice_name]
-            logger.info(f"Using stored voice memory context with {len(context)} segments")
-        elif hasattr(request.app, "voice_memory"):
-            from app.voice_memory import get_voice_context
-            context = get_voice_context(voice_name, generator.device)
-            logger.info(f"Using voice memory context with {len(context)} segments")
-        else:
-            context = []  # No context if voice_memory not available
-        
-        # CRITICAL FIX: Remove any voice instructions in square brackets
-        # CSM model tries to read these instructions otherwise
-        import re
-        clean_text = re.sub(r'^\s*\[[^\]]*\]\s*', '', text)
-        
-        # Generate audio without prompt/instruction text
-        audio = generator.generate(
-            text=clean_text,
-            speaker=speaker,
-            context=context,
-            max_audio_length_ms=max_audio_length_ms,
-            temperature=temperature,
-            topk=topk,
-        )
-        
-        # Audio post-processing - run in background task if performance becomes an issue
-        try:
-            from app.audio_processing import remove_long_silences, enhance_audio_quality
-            # Remove excessive silences
-            audio = remove_long_silences(audio, generator.sample_rate)
-            # Apply audio enhancement
-            audio = enhance_audio_quality(audio, generator.sample_rate)
-            logger.info("Applied audio post-processing")
-        except Exception as e:
-            logger.warning(f"Audio post-processing failed, using raw audio: {e}")
-            
-        # Update voice memory in the background for better voice consistency
-        if hasattr(request.app.state, "voice_memory"):
-            from app.voice_memory import update_voice_memory
-            background_tasks.add_task(
-                update_voice_memory, 
-                voice_name=voice_name, 
-                audio=audio.detach().cpu(), 
-                text=clean_text
-            )
-                
-        # Apply speed adjustment if needed
-        if speed != 1.0 and speed > 0.25:
+        # Check if we have a cache hit
+        if os.path.exists(cache_path):
             try:
-                orig_len = audio.shape[0]
-                # Use torchaudio for high-quality stretching
-                audio = torchaudio.functional.speed(
-                    audio.unsqueeze(0), 
-                    factor=speed
-                ).squeeze(0)
-                logger.info(f"Applied speed adjustment: {speed}x, audio length: {orig_len} → {audio.shape[0]}")
+                with open(cache_path, "rb") as f:
+                    cached_data = f.read()
+                logger.info(f"Cache hit for {response_format} audio")
+                return cached_data, format_to_content_type[response_format]
             except Exception as e:
-                logger.warning(f"Speed adjustment failed: {e}")
-        
-        # Create temporary file for audio conversion
-        with tempfile.NamedTemporaryFile(suffix=f".{response_format}", delete=False) as temp_file:
-            temp_path = temp_file.name
-            
-        # Save to WAV first (direct format for torchaudio)
-        wav_path = f"{temp_path}.wav"
-        torchaudio.save(wav_path, audio.unsqueeze(0).cpu(), generator.sample_rate)
-        
-        # Convert to requested format using ffmpeg
-        import ffmpeg
-        
+                logger.warning(f"Error reading from cache: {e}")
+    
+    # Process audio to the required format
+    start_time = time.time()
+    
+    # Move audio to CPU before saving
+    audio_cpu = audio.cpu()
+    
+    # Use a temporary file for format conversion
+    with tempfile.NamedTemporaryFile(suffix=f".{response_format}", delete=False) as temp_file:
+        temp_path = temp_file.name
         try:
-            if response_format == "mp3":
-                # Higher quality MP3 encoding
-                (
-                    ffmpeg.input(wav_path)
-                    .output(temp_path, format='mp3', audio_bitrate='192k')
-                    .run(quiet=True, overwrite_output=True)
-                )
-            elif response_format == "opus":
-                (
-                    ffmpeg.input(wav_path)
-                    .output(temp_path, format='opus', audio_bitrate='128k')
-                    .run(quiet=True, overwrite_output=True)
-                )
-            elif response_format == "aac":
-                (
-                    ffmpeg.input(wav_path)
-                    .output(temp_path, format='aac', audio_bitrate='192k')
-                    .run(quiet=True, overwrite_output=True)
-                )
-            elif response_format == "flac":
-                (
-                    ffmpeg.input(wav_path)
-                    .output(temp_path, format='flac')
-                    .run(quiet=True, overwrite_output=True)
-                )
-            else:  # wav
-                temp_path = wav_path  # Just use the WAV file directly
-                response_format = "wav"  # Ensure correct MIME type
-        except Exception as e:
-            logger.error(f"Format conversion failed: {e}, returning WAV")
-            temp_path = wav_path
-            response_format = "wav"
-        
-        # Clean up the temporary WAV file if we created a different format
-        if temp_path != wav_path and os.path.exists(wav_path):
-            os.unlink(wav_path)
+            if response_format == 'wav':
+                # Direct save for WAV
+                torchaudio.save(temp_path, audio_cpu.unsqueeze(0), sample_rate)
+            else:
+                # For other formats, first save as WAV then convert
+                wav_path = f"{temp_path}.wav"
+                torchaudio.save(wav_path, audio_cpu.unsqueeze(0), sample_rate)
+                
+                # Use ffmpeg via torchaudio for conversion
+                if hasattr(torchaudio.backend, 'sox_io_backend'):  # New torchaudio structure
+                    if response_format == 'mp3':
+                        # For MP3, use higher quality
+                        sox_effects = torchaudio.sox_effects.SoxEffectsChain()
+                        sox_effects.set_input_file(wav_path)
+                        sox_effects.append_effect_to_chain(["rate", f"{sample_rate}"])
+                        # Higher bitrate for better quality
+                        sox_effects.append_effect_to_chain(["gain", "-n"])  # Normalize
+                        out, _ = sox_effects.sox_build_flow_effects()
+                        torchaudio.save(temp_path, out, sample_rate, format="mp3", compression=128)
+                    elif response_format == 'opus':
+                        # Use ffmpeg for opus through a system call
+                        import subprocess
+                        subprocess.run([
+                            "ffmpeg", "-i", wav_path, "-c:a", "libopus", 
+                            "-b:a", "64k", "-vbr", "on", temp_path,
+                            "-y", "-loglevel", "error"
+                        ], check=True)
+                    elif response_format == 'aac':
+                        # Use ffmpeg for AAC through a system call
+                        import subprocess
+                        subprocess.run([
+                            "ffmpeg", "-i", wav_path, "-c:a", "aac", 
+                            "-b:a", "128k", temp_path,
+                            "-y", "-loglevel", "error"
+                        ], check=True)
+                    elif response_format == 'flac':
+                        torchaudio.save(temp_path, audio_cpu.unsqueeze(0), sample_rate, format="flac")
+                else:
+                    # Fallback using external command
+                    import subprocess
+                    if response_format == 'mp3':
+                        subprocess.run([
+                            "ffmpeg", "-i", wav_path, "-codec:a", "libmp3lame", 
+                            "-qscale:a", "2", temp_path,
+                            "-y", "-loglevel", "error"
+                        ], check=True)
+                    elif response_format == 'opus':
+                        subprocess.run([
+                            "ffmpeg", "-i", wav_path, "-c:a", "libopus", 
+                            "-b:a", "64k", "-vbr", "on", temp_path,
+                            "-y", "-loglevel", "error"
+                        ], check=True)
+                    elif response_format == 'aac':
+                        subprocess.run([
+                            "ffmpeg", "-i", wav_path, "-c:a", "aac", 
+                            "-b:a", "128k", temp_path,
+                            "-y", "-loglevel", "error"
+                        ], check=True)
+                    elif response_format == 'flac':
+                        subprocess.run([
+                            "ffmpeg", "-i", wav_path, "-c:a", "flac", temp_path,
+                            "-y", "-loglevel", "error"
+                        ], check=True)
+                
+                # Clean up the temporary WAV file
+                try:
+                    os.unlink(wav_path)
+                except:
+                    pass
             
-        # Log performance metrics
-        generation_time = time.time() - start_time
-        audio_duration = len(audio) / generator.sample_rate
-        rtf = generation_time / audio_duration if audio_duration > 0 else 0
+            # Read the processed audio file
+            with open(temp_path, "rb") as f:
+                response_data = f.read()
+            
+            # Store in cache if enabled
+            if cache_enabled and cache_key:
+                try:
+                    cache_path = os.path.join(getattr(app_state, "audio_cache_dir", "audio_cache"), f"{cache_key}")
+                    with open(cache_path, "wb") as f:
+                        f.write(response_data)
+                    logger.debug(f"Cached {response_format} audio with key: {cache_key}")
+                except Exception as e:
+                    logger.warning(f"Error writing to cache: {e}")
+            
+            # Log processing time
+            processing_time = time.time() - start_time
+            logger.info(f"Processed audio to {response_format} in {processing_time:.3f}s")
+            
+            return response_data, format_to_content_type[response_format]
         
-        logger.info(
-            f"TTS completed in {generation_time:.2f}s for {audio_duration:.2f}s of audio. "
-            f"RTF: {rtf:.2f}x, Format: {response_format}"
-        )
+        except Exception as e:
+            logger.error(f"Error converting audio to {response_format}: {e}")
+            # Fallback to WAV if conversion fails
+            try:
+                wav_path = f"{temp_path}.wav"
+                torchaudio.save(wav_path, audio_cpu.unsqueeze(0), sample_rate)
+                with open(wav_path, "rb") as f:
+                    response_data = f.read()
+                os.unlink(wav_path)
+                return response_data, "audio/wav"
+            except Exception as fallback_error:
+                logger.error(f"Fallback to WAV also failed: {fallback_error}")
+                raise RuntimeError(f"Failed to generate audio in any format: {str(e)}")
         
-        # Return audio file as response
-        def iterfile():
-            with open(temp_path, 'rb') as f:
-                yield from f
-            # Clean up temp file after streaming
-            if os.path.exists(temp_path):
+        finally:
+            # Clean up the temporary file
+            try:
                 os.unlink(temp_path)
-        
-        return StreamingResponse(
-            iterfile(),
-            media_type=MIME_TYPES.get(response_format, "application/octet-stream"),
-            headers={
-                'Content-Disposition': f'attachment; filename="speech.{response_format}"',
-                'X-Processing-Time': f"{generation_time:.2f}",
-                'X-Audio-Duration': f"{audio_duration:.2f}"
-            }
-        )
-        
-    except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        logger.error(f"Speech generation failed: {str(e)}\n{error_trace}")
-        raise HTTPException(status_code=500, detail=f"Speech generation failed: {str(e)}")
-     
+            except:
+                pass
+
 @router.post("/audio/conversation", tags=["Conversation API"])
 async def conversation_to_speech(
     request: Request,
@@ -392,100 +489,57 @@ async def conversation_to_speech(
         logger.error(f"Conversation speech generation failed: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Conversation speech generation failed: {str(e)}")
 
-@router.get("/audio/voices", summary="List available voices")
+@router.get("/audio/voices")
 async def list_voices(request: Request):
     """
-    OpenAI compatible endpoint that returns a list of available voices.
+    List available voices.
     """
-    # Get voice descriptions from profiles if available
-    try:
-        from app.voice_enhancement import VOICE_PROFILES
-        voices = []
-        
-        for name, profile in VOICE_PROFILES.items():
-            # Check if the profile has the expected attributes
-            if hasattr(profile, 'timbre') and hasattr(profile, 'pitch_range'):
-                description = f"{profile.timbre.capitalize()} voice with {int(profile.pitch_range[0])}-{int(profile.pitch_range[1])}Hz range"
-            else:
-                # Fallback descriptions if attributes are missing
-                descriptions = {
-                    "alloy": "Balanced voice with natural tone",
-                    "echo": "Resonant voice with deeper qualities", 
-                    "fable": "Brighter voice with higher pitch",
-                    "onyx": "Deep, authoritative voice",
-                    "nova": "Warm, pleasant voice with medium range",
-                    "shimmer": "Light, airy voice with higher frequencies"
-                }
-                description = descriptions.get(name, f"Voice: {name}")
-            
-            voices.append({
-                "voice_id": name,
-                "name": name.capitalize(),
-                "preview_url": None,
-                "description": description,
-                "languages": [{"language_code": "en", "name": "English"}]
-            })
-    except ImportError or Exception as e:
-        # Fallback to basic voice descriptions
-        voices = [
-            {
-                "voice_id": "alloy",
-                "name": "Alloy",
-                "preview_url": None,
-                "description": "Balanced voice with natural tone",
-                "languages": [{"language_code": "en", "name": "English"}]
-            },
-            {
-                "voice_id": "echo",
-                "name": "Echo",
-                "preview_url": None,
-                "description": "Resonant voice with deeper qualities",
-                "languages": [{"language_code": "en", "name": "English"}]
-            },
-            {
-                "voice_id": "fable",
-                "name": "Fable",
-                "preview_url": None,
-                "description": "Brighter voice with higher pitch",
-                "languages": [{"language_code": "en", "name": "English"}]
-            },
-            {
-                "voice_id": "onyx",
-                "name": "Onyx",
-                "preview_url": None,
-                "description": "Deep, authoritative voice",
-                "languages": [{"language_code": "en", "name": "English"}]
-            },
-            {
-                "voice_id": "nova",
-                "name": "Nova",
-                "preview_url": None,
-                "description": "Warm, pleasant voice with medium range",
-                "languages": [{"language_code": "en", "name": "English"}]
-            },
-            {
-                "voice_id": "shimmer",
-                "name": "Shimmer",
-                "preview_url": None,
-                "description": "Light, airy voice with higher frequencies",
-                "languages": [{"language_code": "en", "name": "English"}]
-            }
-        ]
+    # Standard voices with their descriptions
+    standard_voices = [
+        {
+            "voice_id": "alloy",
+            "name": "Alloy",
+            "description": "Balanced and versatile, suitable for a wide range of content."
+        },
+        {
+            "voice_id": "echo",
+            "name": "Echo",
+            "description": "Resonant and full-bodied with a touch of reverberance."
+        },
+        {
+            "voice_id": "fable",
+            "name": "Fable",
+            "description": "Brighter and higher-pitched, good for narration and storytelling."
+        },
+        {
+            "voice_id": "onyx",
+            "name": "Onyx",
+            "description": "Deep and authoritative with a rich, powerful tone."
+        },
+        {
+            "voice_id": "nova",
+            "name": "Nova",
+            "description": "Warm and smooth, creating a calming, pleasant impression."
+        },
+        {
+            "voice_id": "shimmer",
+            "name": "Shimmer",
+            "description": "Light and airy with higher frequencies, good for lively content."
+        }
+    ]
     
     # Add cloned voices if available
-    if hasattr(request.app.state, "voice_cloner"):
+    if hasattr(request.app.state, "voice_cloner") and request.app.state.voice_cloner is not None:
         voice_cloner = request.app.state.voice_cloner
-        for voice in voice_cloner.list_voices():
-            voices.append({
-                "voice_id": voice.id,
+        for voice_id, voice in voice_cloner.cloned_voices.items():
+            cloned_voice = {
+                "voice_id": voice_id,
                 "name": voice.name,
-                "preview_url": f"/v1/voice-cloning/voices/{voice.id}/preview",
-                "description": voice.description or f"Cloned voice: {voice.name}",
-                "languages": [{"language_code": "en", "name": "English"}],
-                "cloned": True
-            })
+                "description": voice.description or f"Cloned voice: {voice.name}"
+            }
+            standard_voices.append(cloned_voice)
     
-    return {"voices": voices}
+    return {"voices": standard_voices}
 
 # Add OpenAI-compatible models list endpoint
 @router.get("/audio/models", summary="List available audio models")

@@ -44,7 +44,6 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events."""
     # STARTUP EVENT
     logger.info("Starting application initialization")
-    
     app.state.startup_time = time.time()
     app.state.generator = None  # Will be populated later if model loads
     app.state.logger = logger  # Make logger available to routes
@@ -55,6 +54,7 @@ async def lifespan(app: FastAPI):
     os.makedirs("voice_memories", exist_ok=True)
     os.makedirs("voice_references", exist_ok=True)
     os.makedirs("cloned_voices", exist_ok=True)
+    os.makedirs("audio_cache", exist_ok=True)
     
     # Set tokenizer cache
     try:
@@ -78,7 +78,6 @@ async def lifespan(app: FastAPI):
         device_count = torch.cuda.device_count()
         device_name = torch.cuda.get_device_name(0) if device_count > 0 else "unknown"
         logger.info(f"CUDA is available: {device_count} device(s). Using {device_name}")
-        
         # Report CUDA memory
         if hasattr(torch.cuda, 'get_device_properties'):
             total_memory = torch.cuda.get_device_properties(0).total_memory
@@ -89,7 +88,6 @@ async def lifespan(app: FastAPI):
     # Determine device and device mapping
     device = "cuda" if cuda_available else "cpu"
     device_map = os.environ.get("CSM_DEVICE_MAP", None)  # Options: "auto", "balanced", "sequential"
-    
     if device_map and cuda_available:
         if torch.cuda.device_count() > 1:
             logger.info(f"Using device mapping strategy: {device_map} across {torch.cuda.device_count()} GPUs")
@@ -105,19 +103,16 @@ async def lifespan(app: FastAPI):
     
     # Check if model file exists
     model_path = os.path.join("models", "ckpt.pt")
-    
     if not os.path.exists(model_path):
         # Try to download at runtime if not present
         logger.info("Model not found. Attempting to download...")
         try:
             from huggingface_hub import hf_hub_download, login
-            
             # Check for token in environment
             hf_token = os.environ.get("HF_TOKEN")
             if hf_token:
                 logger.info("Logging in to Hugging Face using provided token")
                 login(token=hf_token)
-                
             logger.info("Downloading CSM-1B model from Hugging Face...")
             download_start = time.time()
             model_path = hf_hub_download(
@@ -140,10 +135,8 @@ async def lifespan(app: FastAPI):
     try:
         logger.info("Loading CSM-1B model...")
         load_start = time.time()
-        
         from app.generator import load_csm_1b
         app.state.generator = load_csm_1b(model_path, device, device_map)
-        
         load_time = time.time() - load_start
         logger.info(f"Model loaded successfully in {load_time:.2f} seconds")
         
@@ -156,36 +149,59 @@ async def lifespan(app: FastAPI):
         try:
             from app.voice_enhancement import initialize_voice_profiles, save_voice_profiles
             initialize_voice_profiles()
+            app.state.voice_enhancement_enabled = True
             logger.info("Voice profiles initialized successfully")
         except Exception as e:
             error_stack = traceback.format_exc()
             logger.error(f"Error initializing voice profiles: {str(e)}\n{error_stack}")
             logger.warning("Voice enhancement features will be limited")
+            app.state.voice_enhancement_enabled = False
+        
+        # Initialize voice memory system for consistent generation
+        logger.info("Initializing voice memory system...")
+        try:
+            from app.voice_memory import initialize_voices
+            initialize_voices(app.state.sample_rate)
+            app.state.voice_memory_enabled = True
+            logger.info("Voice memory system initialized")
+        except Exception as e:
+            logger.warning(f"Error initializing voice memory: {e}")
+            app.state.voice_memory_enabled = False
         
         # Initialize voice cloning system
         try:
             logger.info("Initializing voice cloning system...")
             from app.voice_cloning import VoiceCloner, CLONED_VOICES_DIR
-            
             # Update the cloned voices directory to use the persistent volume
-            CLONED_VOICES_DIR = "/app/cloned_voices"
-            os.makedirs(CLONED_VOICES_DIR, exist_ok=True)
+            app.state.cloned_voices_dir = "/app/cloned_voices"  # Store path in app state for access
+            os.makedirs(app.state.cloned_voices_dir, exist_ok=True)
+            CLONED_VOICES_DIR = app.state.cloned_voices_dir  # Update the module constant
             
+            # Initialize the voice cloner with proper device
             app.state.voice_cloner = VoiceCloner(app.state.generator, device=device)
             
             # Make sure existing voices are loaded
             app.state.voice_cloner._load_existing_voices()
-            logger.info(f"Voice cloning system initialized with {len(app.state.voice_cloner.list_voices())} existing voices from {CLONED_VOICES_DIR}")
+            
+            # Log the available voices
+            cloned_voices = app.state.voice_cloner.list_voices()
+            logger.info(f"Voice cloning system initialized with {len(cloned_voices)} existing voices")
+            for voice in cloned_voices:
+                logger.info(f"  - {voice.name} (ID: {voice.id}, Speaker ID: {voice.speaker_id})")
+            
+            # Flag for voice cloning availability
+            app.state.voice_cloning_enabled = True
         except Exception as e:
             error_stack = traceback.format_exc()
             logger.error(f"Error initializing voice cloning: {e}\n{error_stack}")
             logger.warning("Voice cloning features will not be available")
+            app.state.voice_cloning_enabled = False
         
         # Create prompt templates for consistent generation
         logger.info("Setting up prompt engineering templates...")
         try:
             from app.prompt_engineering import initialize_templates
-            initialize_templates()
+            app.state.prompt_templates = initialize_templates()
             logger.info("Prompt templates initialized")
         except Exception as e:
             error_stack = traceback.format_exc()
@@ -205,37 +221,165 @@ async def lifespan(app: FastAPI):
         
         # Start as a background task
         asyncio.create_task(generate_samples_async())
-            
-        # Initialize voice cache
+        
+        # Initialize voice cache for all voices (standard + cloned)
         app.state.voice_cache = {}
-        for voice in ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]:
+        
+        # Add standard voices
+        standard_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+        for voice in standard_voices:
             app.state.voice_cache[voice] = []
-            
-        # Log model information
+        
+        # Add cloned voices to cache if they exist
+        if app.state.voice_cloning_enabled and hasattr(app.state, "voice_cloner"):
+            for voice in app.state.voice_cloner.list_voices():
+                app.state.voice_cache[voice.id] = []
+                # Also add by name for more flexible lookup
+                app.state.voice_cache[voice.name] = []
+        
+        # Create mapping from voice name/id to speaker_id for easy lookup
+        app.state.voice_speaker_map = {
+            "alloy": 0, "echo": 1, "fable": 2, "onyx": 3, "nova": 4, "shimmer": 5
+        }
+        
+        # Add cloned voices to the speaker map
+        if app.state.voice_cloning_enabled and hasattr(app.state, "voice_cloner"):
+            for voice in app.state.voice_cloner.list_voices():
+                app.state.voice_speaker_map[voice.id] = voice.speaker_id
+                app.state.voice_speaker_map[voice.name] = voice.speaker_id
+                app.state.voice_speaker_map[str(voice.speaker_id)] = voice.speaker_id
+        
+        # Compile voice information for API
+        app.state.available_voices = standard_voices.copy()
+        if app.state.voice_cloning_enabled and hasattr(app.state, "voice_cloner"):
+            for voice in app.state.voice_cloner.list_voices():
+                app.state.available_voices.append(voice.id)
+                app.state.available_voices.append(voice.name)
+        
+        # Store model information for API endpoints
         app.state.model_info = {
             "name": "CSM-1B",
             "device": device,
             "device_map": device_map,
             "sample_rate": app.state.sample_rate,
-            "voices": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
-            "enhancements_enabled": True
+            "standard_voices": standard_voices,
+            "cloned_voices": [v.id for v in app.state.voice_cloner.list_voices()] if app.state.voice_cloning_enabled else [],
+            "voice_enhancement_enabled": app.state.voice_enhancement_enabled,
+            "voice_memory_enabled": app.state.voice_memory_enabled,
+            "voice_cloning_enabled": app.state.voice_cloning_enabled
         }
         
+        # Create a function to access all voices in a standardized format
+        def get_all_available_voices():
+            """Helper function to get all available voices for API endpoints"""
+            # Standard voices with fixed descriptions
+            all_voices = [
+                {"voice_id": "alloy", "name": "Alloy", "description": "Balanced and natural"},
+                {"voice_id": "echo", "name": "Echo", "description": "Resonant and deeper"},
+                {"voice_id": "fable", "name": "Fable", "description": "Bright and higher-pitched"},
+                {"voice_id": "onyx", "name": "Onyx", "description": "Deep and authoritative"},
+                {"voice_id": "nova", "name": "Nova", "description": "Warm and smooth"},
+                {"voice_id": "shimmer", "name": "Shimmer", "description": "Light and airy"}
+            ]
+            
+            # Add cloned voices if available
+            if app.state.voice_cloning_enabled and hasattr(app.state, "voice_cloner"):
+                for voice in app.state.voice_cloner.list_voices():
+                    all_voices.append({
+                        "voice_id": voice.id,
+                        "name": voice.name,
+                        "description": voice.description or f"Cloned voice: {voice.name}"
+                    })
+            
+            return all_voices
+        
+        app.state.get_all_voices = get_all_available_voices
+        
+        # Add helper function to lookup voice info
+        def get_voice_info(voice_identifier):
+            """Look up voice information based on name, ID, or speaker_id"""
+            # Check standard voices
+            if voice_identifier in standard_voices:
+                return {
+                    "type": "standard",
+                    "voice_id": voice_identifier,
+                    "name": voice_identifier,
+                    "speaker_id": standard_voices.index(voice_identifier)
+                }
+            
+            # Look for cloned voice
+            if not app.state.voice_cloning_enabled or not hasattr(app.state, "voice_cloner"):
+                return None
+                
+            # Check by ID
+            if voice_identifier in app.state.voice_cloner.cloned_voices:
+                voice = app.state.voice_cloner.cloned_voices[voice_identifier]
+                return {
+                    "type": "cloned",
+                    "voice_id": voice.id,
+                    "name": voice.name,
+                    "speaker_id": voice.speaker_id
+                }
+                
+            # Check by name
+            for v_id, voice in app.state.voice_cloner.cloned_voices.items():
+                if voice.name == voice_identifier:
+                    return {
+                        "type": "cloned",
+                        "voice_id": voice.id,
+                        "name": voice.name,
+                        "speaker_id": voice.speaker_id
+                    }
+                    
+            # Check by speaker_id (string representation)
+            try:
+                speaker_id = int(voice_identifier)
+                # Check if any cloned voice has this speaker_id
+                for v_id, voice in app.state.voice_cloner.cloned_voices.items():
+                    if voice.speaker_id == speaker_id:
+                        return {
+                            "type": "cloned", 
+                            "voice_id": voice.id,
+                            "name": voice.name,
+                            "speaker_id": speaker_id
+                        }
+            except (ValueError, TypeError):
+                pass
+                
+            # No match found
+            return None
+            
+        app.state.get_voice_info = get_voice_info
+        
+        # Set up audio cache
+        app.state.audio_cache_enabled = os.environ.get("ENABLE_AUDIO_CACHE", "true").lower() == "true"
+        if app.state.audio_cache_enabled:
+            app.state.audio_cache_dir = "audio_cache"
+            logger.info(f"Audio cache enabled, cache dir: {app.state.audio_cache_dir}")
+        
         # Log GPU utilization after model loading
-        if cuda_available and torch.cuda.device_count() > 1 and device_map:
-            logger.info("Multi-GPU setup active with the following memory usage:")
-            for i in range(torch.cuda.device_count()):
-                memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
-                memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)
-                logger.info(f"GPU {i}: {memory_allocated:.2f} GB allocated, {memory_reserved:.2f} GB reserved")
+        if cuda_available:
+            memory_allocated = torch.cuda.memory_allocated() / (1024**3)
+            memory_reserved = torch.cuda.memory_reserved() / (1024**3)
+            logger.info(f"GPU memory: {memory_allocated:.2f} GB allocated, {memory_reserved:.2f} GB reserved")
+            
+            if torch.cuda.device_count() > 1 and device_map:
+                logger.info("Multi-GPU setup active with the following memory usage:")
+                for i in range(torch.cuda.device_count()):
+                    memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                    memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                    logger.info(f"GPU {i}: {memory_allocated:.2f} GB allocated, {memory_reserved:.2f} GB reserved")
         
         logger.info(f"CSM-1B TTS API is ready on {device} with sample rate {app.state.sample_rate}")
+        logger.info(f"Standard voices: {standard_voices}")
+        cloned_count = len(app.state.voice_cloner.list_voices()) if app.state.voice_cloning_enabled else 0
+        logger.info(f"Cloned voices: {cloned_count}")
         
     except Exception as e:
         error_stack = traceback.format_exc()
         logger.error(f"Error loading model: {str(e)}\n{error_stack}")
         app.state.generator = None
-        
+    
     # Calculate total startup time
     startup_time = time.time() - app.state.startup_time
     logger.info(f"Application startup completed in {startup_time:.2f} seconds")
@@ -258,12 +402,24 @@ async def lifespan(app: FastAPI):
     
     # Save voice profiles if they've been updated
     try:
-        from app.voice_enhancement import save_voice_profiles
-        logger.info("Saving voice profiles...")
-        save_voice_profiles()
-        logger.info("Voice profiles saved successfully")
+        if hasattr(app.state, "voice_enhancement_enabled") and app.state.voice_enhancement_enabled:
+            from app.voice_enhancement import save_voice_profiles
+            logger.info("Saving voice profiles...")
+            save_voice_profiles()
+            logger.info("Voice profiles saved successfully")
     except Exception as e:
         logger.error(f"Error saving voice profiles: {e}")
+    
+    # Clean up any temporary files
+    try:
+        for temp_file in glob.glob(os.path.join(tempfile.gettempdir(), "csm_tts_*")):
+            try:
+                os.remove(temp_file)
+                logger.info(f"Removed temporary file: {temp_file}")
+            except:
+                pass
+    except Exception as e:
+        logger.warning(f"Error cleaning up temporary files: {e}")
     
     logger.info("Application shutdown complete")
     
@@ -310,23 +466,20 @@ async def add_process_time_header(request: Request, call_next):
 
 # Health check endpoint
 @app.get("/health", include_in_schema=False)
-async def health_check():
+async def health_check(request: Request):
     """Health check endpoint that returns the status of the API."""
-    model_status = "healthy" if hasattr(app.state, "generator") and app.state.generator is not None else "unhealthy"
-    uptime = time.time() - getattr(app.state, "startup_time", time.time())
+    model_status = "healthy" if hasattr(request.app.state, "generator") and request.app.state.generator is not None else "unhealthy"
+    uptime = time.time() - getattr(request.app.state, "startup_time", time.time())
+
+    # Get voice information
+    standard_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+    cloned_voices = []
     
-    # Get enhanced voices info
-    voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-    try:
-        from app.voice_enhancement import VOICE_PROFILES
-        voices = list(VOICE_PROFILES.keys())
-    except Exception:
-        pass
-    
-    # Get cloned voices count
-    cloned_voices_count = 0
-    if hasattr(app.state, "voice_cloner"):
-        cloned_voices_count = len(app.state.voice_cloner.list_voices())
+    if hasattr(request.app.state, "voice_cloner") and request.app.state.voice_cloner is not None:
+        cloned_voices = [
+            {"id": v.id, "name": v.name, "speaker_id": v.speaker_id}
+            for v in request.app.state.voice_cloner.list_voices()
+        ]
     
     # Get CUDA memory stats if available
     cuda_stats = None
@@ -339,13 +492,14 @@ async def health_check():
     return {
         "status": model_status,
         "uptime": f"{uptime:.2f} seconds",
-        "device": getattr(app.state, "device", "unknown"),
+        "device": getattr(request.app.state, "device", "unknown"),
         "model": "CSM-1B",
-        "voices": voices,
-        "cloned_voices_count": cloned_voices_count,
-        "sample_rate": getattr(app.state, "sample_rate", 0),
-        "enhancements": "enabled" if hasattr(app.state, "model_info") and 
-                        app.state.model_info.get("enhancements_enabled", False) else "disabled",
+        "standard_voices": standard_voices,
+        "cloned_voices": cloned_voices,
+        "cloned_voices_count": len(cloned_voices),
+        "sample_rate": getattr(request.app.state, "sample_rate", 0),
+        "enhancements": "enabled" if hasattr(request.app.state, "model_info") and 
+                      request.app.state.model_info.get("enhancements_enabled", False) else "disabled",
         "cuda": cuda_stats,
         "version": "1.0.0"
     }
