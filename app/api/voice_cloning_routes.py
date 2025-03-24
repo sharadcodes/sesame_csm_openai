@@ -4,12 +4,10 @@ import io
 import time
 import tempfile
 from typing import Dict, List, Optional, Any
-
 import torch
 import torchaudio
 from fastapi import APIRouter, Request, Response, HTTPException, UploadFile, File, Form, Body
 from fastapi.responses import StreamingResponse, JSONResponse
-
 from app.voice_cloning import ClonedVoice
 
 # Create router
@@ -84,8 +82,6 @@ async def delete_voice(request: Request, voice_id: str):
         "status": "success",
         "message": f"Voice {voice_id} deleted successfully"
     }
-
-# In app/api/voice_cloning_routes.py
 
 @router.post("/clone-from-youtube", summary="Clone a voice from YouTube")
 async def clone_voice_from_youtube(
@@ -176,8 +172,9 @@ async def generate_speech(
         response_format = "mp3"
     
     try:
-        # Generate speech with the cloned voice
-        audio = await voice_cloner.generate_speech(
+        # Generate speech with the cloned voice - IMPORTANT: This is a synchronous operation
+        # Remove the await keyword here
+        audio = voice_cloner.generate_speech(
             text=text,
             voice_id=voice_id,
             temperature=temperature

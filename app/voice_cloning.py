@@ -624,20 +624,16 @@ class VoiceCloner:
         Returns:
             Generated audio tensor
         """
-        # Remove any async/await keywords
-        
+        # Remove any async/await keywords - this is a synchronous function
         if voice_id not in self.cloned_voices:
             raise ValueError(f"Voice ID {voice_id} not found")
-        
         voice = self.cloned_voices[voice_id]
         context = self.get_voice_context(voice_id)
         if not context:
             raise ValueError(f"Could not get context for voice {voice_id}")
-        
         # Preprocess text for better pronunciation
         processed_text = self._preprocess_text(text)
         logger.info(f"Generating speech with voice '{voice.name}' (ID: {voice_id}, speaker: {voice.speaker_id})")
-        
         try:
             # Check if text is too long and should be split
             if len(processed_text) > 200:
@@ -698,7 +694,7 @@ class VoiceCloner:
         except Exception as e:
             logger.error(f"Error generating speech with voice {voice_id}: {e}")
             raise
-                
+            
     def _preprocess_text(self, text: str) -> str:
         """Preprocess text for better pronunciation and voice cloning."""
         # Make sure text ends with punctuation for better phrasing
