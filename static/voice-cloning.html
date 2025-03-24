@@ -709,6 +709,29 @@
                 font-size: 0.9rem;
             }
         }
+        /* Checkbox styling */
+        .checkbox-group {
+            margin-bottom: 20px;
+        }
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 0.95rem;
+        }
+        input[type="checkbox"] {
+            width: auto;
+            margin-right: 10px;
+            height: 18px;
+            width: 18px;
+            cursor: pointer;
+            accent-color: var(--primary-color);
+        }
+        .checkbox-text {
+            position: relative;
+            top: 1px;
+        }
     </style>
 </head>
 <body>
@@ -826,6 +849,13 @@
                         <label>Temperature: <span id="temperature-value">0.7</span></label>
                         <input type="range" id="temperature" name="temperature" min="0.5" max="1.0" step="0.05" value="0.7">
                         <small>Lower values (0.5-0.7) produce more consistent speech, higher values (0.8-1.0) produce more varied speech.</small>
+                    </div>
+                    <div class="form-group checkbox-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="use-streaming" name="use_streaming">
+                            <span class="checkbox-text">Use streaming mode</span>
+                        </label>
+                        <small>Stream audio as it's generated for faster start and lower latency.</small>
                     </div>
                     <button type="submit">Generate Speech</button>
                 </form>
@@ -1231,11 +1261,11 @@
         // Generate speech form submission
         document.getElementById('generate-form').addEventListener('submit', async (event) => {
             event.preventDefault();
-            
             const formData = new FormData(event.target);
             const voiceId = formData.get('voice');
             const text = formData.get('text');
             const temperature = formData.get('temperature');
+            const useStreaming = formData.get('use_streaming') === 'on';
             
             if (!voiceId) {
                 showToast('Please select a voice', 'warning');
@@ -1244,39 +1274,70 @@
             
             const submitButton = event.target.querySelector('button[type="submit"]');
             const originalText = submitButton.textContent;
-            
             submitButton.disabled = true;
             submitButton.innerHTML = '<div class="spinner"></div> Generating...';
-            showStatus('Generating speech...', 'info');
+            showStatus(useStreaming ? 'Streaming speech...' : 'Generating speech...', 'info');
             
             try {
-                const response = await fetch('/v1/voice-cloning/generate', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        voice_id: voiceId,
-                        text: text,
-                        temperature: parseFloat(temperature)
-                    })
-                });
+                const audioPreview = document.getElementById('audio-preview');
                 
-                if (response.ok) {
-                    const blob = await response.blob();
-                    const url = URL.createObjectURL(blob);
-                    const audioPreview = document.getElementById('audio-preview');
+                if (useStreaming) {
+                    // For streaming, we fetch from the streaming endpoint
+                    const response = await fetch('/v1/audio/speech/streaming', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            model: "csm-1b",
+                            input: text,
+                            voice: voiceId,
+                            response_format: "mp3",
+                            temperature: parseFloat(temperature),
+                            speed: 1.0
+                        })
+                    });
                     
-                    audioPreview.src = url;
-                    audioPreview.style.display = 'block';
-                    audioPreview.play();
-                    
-                    showStatus('Speech generated successfully', 'success');
-                    showToast('Speech generated successfully', 'success');
+                    if (response.ok) {
+                        const blob = await response.blob();
+                        const url = URL.createObjectURL(blob);
+                        audioPreview.src = url;
+                        audioPreview.style.display = 'block';
+                        audioPreview.play();
+                        showStatus('Speech streamed successfully', 'success');
+                        showToast('Speech streamed successfully', 'success');
+                    } else {
+                        const error = await response.json();
+                        showStatus(`Failed to stream speech: ${error.detail}`, 'error');
+                        showToast('Failed to stream speech', 'error');
+                    }
                 } else {
-                    const error = await response.json();
-                    showStatus(`Failed to generate speech: ${error.detail}`, 'error');
-                    showToast('Failed to generate speech', 'error');
+                    // Non-streaming uses the original endpoint
+                    const response = await fetch('/v1/voice-cloning/generate', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            voice_id: voiceId,
+                            text: text,
+                            temperature: parseFloat(temperature)
+                        })
+                    });
+                    
+                    if (response.ok) {
+                        const blob = await response.blob();
+                        const url = URL.createObjectURL(blob);
+                        audioPreview.src = url;
+                        audioPreview.style.display = 'block';
+                        audioPreview.play();
+                        showStatus('Speech generated successfully', 'success');
+                        showToast('Speech generated successfully', 'success');
+                    } else {
+                        const error = await response.json();
+                        showStatus(`Failed to generate speech: ${error.detail}`, 'error');
+                        showToast('Failed to generate speech', 'error');
+                    }
                 }
             } catch (error) {
                 console.error('Error generating speech:', error);
@@ -1287,7 +1348,7 @@
                 submitButton.textContent = originalText;
             }
         });
-        
+
         // Load voices on page load
         loadVoices();
     </script>

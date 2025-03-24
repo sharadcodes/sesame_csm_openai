@@ -7,21 +7,20 @@ import base64
 import time
 import tempfile
 import logging
+import asyncio
 from enum import Enum
 from typing import Dict, List, Optional, Any, Union
-
 import torch
 import torchaudio
 import numpy as np
-from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, Body, Response
+from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, Body, Response, Query
 from fastapi.responses import StreamingResponse
-
-from app.api.schemas import TTSRequest, ResponseFormat, Voice
+from app.api.schemas import SpeechRequest, ResponseFormat, Voice
 from app.models import Segment
+from app.api.streaming import AudioChunker
 
 # Set up logging
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
 
 # Mapping of response_format to MIME types
@@ -33,73 +32,93 @@ MIME_TYPES = {
     "wav": "audio/wav",
 }
 
-@router.post("/audio/speech", response_class=Response)
-async def text_to_speech(
+def get_speaker_id(app_state, voice):
+    """Helper function to get speaker ID from voice name or ID"""
+    if hasattr(app_state, "voice_speaker_map") and voice in app_state.voice_speaker_map:
+        return app_state.voice_speaker_map[voice]
+        
+    # Standard voices mapping
+    voice_to_speaker = {"alloy": 0, "echo": 1, "fable": 2, "onyx": 3, "nova": 4, "shimmer": 5}
+    
+    if voice in voice_to_speaker:
+        return voice_to_speaker[voice]
+    
+    # Try parsing as integer
+    try:
+        speaker_id = int(voice)
+        if 0 <= speaker_id < 6:
+            return speaker_id
+    except (ValueError, TypeError):
+        pass
+    
+    # Check cloned voices if the voice cloner exists
+    if hasattr(app_state, "voice_cloner") and app_state.voice_cloner is not None:
+        # Check by ID
+        if voice in app_state.voice_cloner.cloned_voices:
+            return app_state.voice_cloner.cloned_voices[voice].speaker_id
+            
+        # Check by name
+        for v_id, v_info in app_state.voice_cloner.cloned_voices.items():
+            if v_info.name.lower() == voice.lower():
+                return v_info.speaker_id
+    
+    # Default to alloy
+    return 0
+
+@router.post("/audio/speech", tags=["Audio"], response_class=Response)
+async def generate_speech(
     request: Request,
-    tts_request: TTSRequest,
+    speech_request: SpeechRequest,
 ):
     """
-    TextToSpeech API compatible with OpenAI TTS API.
+    Generate audio of text being spoken by a realistic voice.
+    
+    This endpoint is compatible with the OpenAI TTS API.
+    
+    For streaming responses, use `/v1/audio/speech/streaming` instead.
     """
     # Check if model is available
     if not hasattr(request.app.state, "generator") or request.app.state.generator is None:
         raise HTTPException(status_code=503, detail="TTS model not available")
     
     # Set default values
-    model = tts_request.model
-    voice = tts_request.voice
-    input_text = tts_request.input
-    response_format = tts_request.response_format.value if isinstance(tts_request.response_format, Enum) else tts_request.response_format
-    speed = tts_request.speed
-    temperature = tts_request.temperature
-    max_audio_length_ms = tts_request.max_audio_length_ms
+    model = speech_request.model
+    voice = speech_request.voice
+    input_text = speech_request.input
+    response_format = speech_request.response_format
+    speed = speech_request.speed
+    temperature = speech_request.temperature
+    max_audio_length_ms = speech_request.max_audio_length_ms
     
     # Log request details
     logger.info(f"TTS request: text length={len(input_text)}, voice={voice}, format={response_format}")
     
-    # Standard voices
-    standard_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-    
-    # Check if the requested voice is a cloned voice
-    cloned_voice_id = None
-    voice_cloner = None if not hasattr(request.app.state, "voice_cloner") else request.app.state.voice_cloner
-    
-    # First, determine if we need to use a cloned voice
-    if voice_cloner is not None and voice not in standard_voices:
-        # Check directly by ID
-        if voice in voice_cloner.cloned_voices:
-            cloned_voice_id = voice
-            logger.info(f"Using cloned voice with ID: {cloned_voice_id}")
-        else:
-            # Try to find by name
-            for v_id, v_info in voice_cloner.cloned_voices.items():
-                if v_info.name.lower() == voice.lower() or v_info.name.lower().replace(' ', '_') == voice.lower():
-                    cloned_voice_id = v_id
-                    logger.info(f"Found cloned voice '{v_info.name}' with ID: {cloned_voice_id}")
-                    break
-            
-            # Also check by speaker_id (as a string, since it might be passed that way)
-            if cloned_voice_id is None:
-                try:
-                    for v_id, v_info in voice_cloner.cloned_voices.items():
-                        if str(v_info.speaker_id) == str(voice):
-                            cloned_voice_id = v_id
-                            logger.info(f"Found cloned voice by speaker_id {voice} with ID: {cloned_voice_id}")
-                            break
-                except:
-                    pass
-    
     try:
+        # Get speaker ID for the voice
+        speaker_id = get_speaker_id(request.app.state, voice)
+        if speaker_id is None:
+            raise HTTPException(status_code=400, detail=f"Voice '{voice}' not found")
+        
+        # Check if this is a cloned voice
+        voice_info = None
+        cloned_voice_id = None
+        
+        if hasattr(request.app.state, "get_voice_info"):
+            voice_info = request.app.state.get_voice_info(voice)
+            if voice_info and voice_info["type"] == "cloned":
+                cloned_voice_id = voice_info["voice_id"]
+                
         # Generate audio based on whether it's a standard or cloned voice
-        if cloned_voice_id is not None and voice_cloner is not None:
+        if cloned_voice_id is not None and hasattr(request.app.state, "voice_cloner"):
             # Generate speech with cloned voice
             logger.info(f"Generating speech with cloned voice ID: {cloned_voice_id}")
             try:
+                voice_cloner = request.app.state.voice_cloner
                 audio = voice_cloner.generate_speech(
                     text=input_text,
                     voice_id=cloned_voice_id,
                     temperature=temperature,
-                    topk=tts_request.topk or 30,
+                    topk=speech_request.topk or 30,
                     max_audio_length_ms=max_audio_length_ms
                 )
                 sample_rate = request.app.state.sample_rate
@@ -112,37 +131,39 @@ async def text_to_speech(
                 )
         else:
             # Generate speech with standard voice
-            # Map voice name to speaker ID for standard voices
-            voice_to_speaker = {"alloy": 0, "echo": 1, "fable": 2, "onyx": 3, "nova": 4, "shimmer": 5}
-            
-            if voice in voice_to_speaker:
-                speaker_id = voice_to_speaker[voice]
-            else:
-                try:
-                    # Try to parse as integer directly
-                    speaker_id = int(voice)
-                    if speaker_id not in range(6):
-                        speaker_id = 0  # Default to alloy if out of range
-                except (ValueError, TypeError):
-                    speaker_id = 0  # Default to alloy if parsing fails
-            
-            # Check for voice context from memory
+            # Use voice context from memory if enabled
             if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
                 from app.voice_memory import get_voice_context
                 context = get_voice_context(voice, torch.device(request.app.state.device))
             else:
                 context = []
             
+            # Apply optional text enhancement for better voice consistency
+            enhanced_text = input_text
+            if hasattr(request.app.state, "prompt_templates"):
+                from app.prompt_engineering import format_text_for_voice
+                enhanced_text = format_text_for_voice(input_text, voice)
+            
             # Generate audio
             audio = request.app.state.generator.generate(
-                text=input_text,
+                text=enhanced_text,
                 speaker=speaker_id,
                 context=context,
                 temperature=temperature,
-                topk=tts_request.topk or 50,
+                topk=speech_request.topk or 50,
                 max_audio_length_ms=max_audio_length_ms
             )
             sample_rate = request.app.state.sample_rate
+            
+            # Process audio for better quality
+            if hasattr(request.app.state, "voice_enhancement_enabled") and request.app.state.voice_enhancement_enabled:
+                from app.voice_enhancement import process_generated_audio
+                audio = process_generated_audio(
+                    audio=audio,
+                    voice_name=voice,
+                    sample_rate=sample_rate,
+                    text=input_text
+                )
             
             # Update voice memory if enabled
             if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
@@ -152,7 +173,6 @@ async def text_to_speech(
         # Handle speed adjustments if not 1.0
         if speed != 1.0 and speed > 0:
             try:
-                import torchaudio
                 # Adjust speed using torchaudio
                 effects = [
                     ["tempo", str(speed)]
@@ -186,6 +206,183 @@ async def text_to_speech(
     except Exception as e:
         logger.error(f"Error in text_to_speech: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/audio/speech/stream", tags=["Audio"])
+async def stream_speech(
+    request: Request,
+    speech_request: SpeechRequest,
+):
+    """
+    Stream audio of text being spoken by a realistic voice.
+    
+    This endpoint provides an OpenAI-compatible streaming interface for TTS.
+    """
+    # Check if model is loaded
+    if not hasattr(request.app.state, "generator") or request.app.state.generator is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="Model not loaded. Please try again later."
+        )
+        
+    # Get request parameters
+    model = speech_request.model
+    input_text = speech_request.input
+    voice = speech_request.voice
+    response_format = speech_request.response_format
+    speed = speech_request.speed
+    temperature = speech_request.temperature
+    max_audio_length_ms = speech_request.max_audio_length_ms
+    
+    # Log the request
+    logger.info(f"Streaming speech from text ({len(input_text)} chars) with voice '{voice}'")
+    
+    # Check if text is empty
+    if not input_text or len(input_text.strip()) == 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="Input text cannot be empty"
+        )
+        
+    # Get speaker ID for the voice
+    speaker_id = get_speaker_id(request.app.state, voice)
+    if speaker_id is None:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Voice '{voice}' not found. Available voices: {request.app.state.available_voices}"
+        )
+        
+    # Use voice memory for context
+    try:
+        # Create media type based on format
+        media_type = {
+            "mp3": "audio/mpeg",
+            "opus": "audio/opus",
+            "aac": "audio/aac",
+            "flac": "audio/flac",
+            "wav": "audio/wav",
+        }.get(response_format, "audio/mpeg")
+        
+        # Create the chunker for streaming
+        sample_rate = request.app.state.sample_rate
+        chunker = AudioChunker(sample_rate, response_format)
+        
+        # Prepare context from voice memory
+        if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
+            from app.voice_memory import get_voice_context
+            context = get_voice_context(voice, request.app.state.device)
+        else:
+            # Empty context
+            context = []
+            
+        # Check for cloned voice
+        voice_info = None
+        if hasattr(request.app.state, "voice_cloning_enabled") and request.app.state.voice_cloning_enabled:
+            voice_info = request.app.state.get_voice_info(voice)
+            if voice_info and voice_info["type"] == "cloned":
+                # Use cloned voice context
+                from app.voice_cloning import VoiceCloner
+                voice_cloner = request.app.state.voice_cloner
+                context = voice_cloner.get_voice_context(voice_info["voice_id"])
+                
+        # Generate audio in a separate task to avoid blocking
+        async def generate_streaming_audio():
+            try:
+                # Apply optional text enhancement
+                enhanced_text = input_text
+                if hasattr(request.app.state, "prompt_templates"):
+                    from app.prompt_engineering import format_text_for_voice
+                    enhanced_text = format_text_for_voice(input_text, voice)
+                
+                # Generate audio
+                if voice_info and voice_info["type"] == "cloned":
+                    # Generate with cloned voice
+                    voice_cloner = request.app.state.voice_cloner
+                    audio = voice_cloner.generate_speech(
+                        text=enhanced_text,
+                        voice_id=voice_info["voice_id"],
+                        temperature=temperature,
+                        topk=speech_request.topk or 30,
+                        max_audio_length_ms=max_audio_length_ms
+                    )
+                else:
+                    # Generate with standard voice
+                    audio = request.app.state.generator.generate(
+                        text=enhanced_text,
+                        speaker=speaker_id,
+                        context=context,
+                        max_audio_length_ms=max_audio_length_ms,
+                        temperature=temperature,
+                    )
+                
+                # Process the audio for better quality
+                if hasattr(request.app.state, "voice_enhancement_enabled") and request.app.state.voice_enhancement_enabled:
+                    from app.voice_enhancement import process_generated_audio
+                    audio = process_generated_audio(
+                        audio=audio,
+                        voice_name=voice,
+                        sample_rate=sample_rate,
+                        text=enhanced_text
+                    )
+                    
+                # Update voice memory with the new audio
+                if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
+                    from app.voice_memory import update_voice_memory
+                    update_voice_memory(voice, audio, enhanced_text)
+                    
+                # Handle speed adjustments if not 1.0
+                if speed != 1.0 and speed > 0:
+                    try:
+                        # Adjust speed using torchaudio
+                        effects = [
+                            ["tempo", str(speed)]
+                        ]
+                        audio_cpu = audio.cpu()
+                        adjusted_audio, _ = torchaudio.sox_effects.apply_effects_tensor(
+                            audio_cpu.unsqueeze(0), 
+                            sample_rate, 
+                            effects
+                        )
+                        audio = adjusted_audio.squeeze(0)
+                        logger.info(f"Adjusted speech speed to {speed}x")
+                    except Exception as e:
+                        logger.warning(f"Failed to adjust speech speed: {e}")
+                    
+                # Stream the audio in chunks
+                async for chunk in chunker.chunk_audio(audio):
+                    yield chunk
+                    
+            except Exception as e:
+                logger.error(f"Error generating streaming audio: {e}")
+                # Send an error message - this will cause client to fail,
+                # but at least we're sending something back
+                error_message = f"Error: {str(e)}".encode()
+                yield error_message
+        
+        # Return streaming response
+        return StreamingResponse(
+            generate_streaming_audio(),
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="speech.{response_format}"'
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error in stream_speech: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating speech: {str(e)}")
+
+@router.post("/audio/speech/streaming", tags=["Audio"])
+async def openai_stream_speech(
+    request: Request,
+    speech_request: SpeechRequest,
+):
+    """
+    Stream audio in OpenAI-compatible streaming format.
+    
+    This endpoint is compatible with the OpenAI streaming TTS API.
+    """
+    # Use the same logic as the stream_speech endpoint but with a different name
+    # to maintain the OpenAI API naming convention
+    return await stream_speech(request, speech_request)
 
 async def format_audio(audio, response_format, sample_rate, app_state):
     """
@@ -237,7 +434,7 @@ async def format_audio(audio, response_format, sample_rate, app_state):
         # Generate a hash of the audio tensor for caching
         audio_hash = hashlib.md5(audio.cpu().numpy().tobytes()).hexdigest()
         cache_key = f"{audio_hash}_{response_format}"
-        cache_dir = getattr(app_state, "audio_cache_dir", "audio_cache")
+        cache_dir = getattr(app_state, "audio_cache_dir", "/app/audio_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = os.path.join(cache_dir, f"{cache_key}")
         
@@ -338,7 +535,7 @@ async def format_audio(audio, response_format, sample_rate, app_state):
             # Store in cache if enabled
             if cache_enabled and cache_key:
                 try:
-                    cache_path = os.path.join(getattr(app_state, "audio_cache_dir", "audio_cache"), f"{cache_key}")
+                    cache_path = os.path.join(getattr(app_state, "audio_cache_dir", "/app/audio_cache"), f"{cache_key}")
                     with open(cache_path, "wb") as f:
                         f.write(response_data)
                     logger.debug(f"Cached {response_format} audio with key: {cache_key}")
@@ -489,13 +686,19 @@ async def conversation_to_speech(
         logger.error(f"Conversation speech generation failed: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Conversation speech generation failed: {str(e)}")
 
-@router.get("/audio/voices")
+@router.get("/audio/voices", tags=["Audio"])
 async def list_voices(request: Request):
     """
     List available voices in a format compatible with OpenAI and OpenWebUI.
     """
-    # Standard voices
-    voices = [
+    # Use app state's get_all_voices function if available
+    if hasattr(request.app.state, "get_all_voices"):
+        voices = request.app.state.get_all_voices()
+        logger.info(f"Listing {len(voices)} voices")
+        return {"voices": voices}
+    
+    # Fallback to standard voices if necessary
+    standard_voices = [
         {"voice_id": "alloy", "name": "Alloy"},
         {"voice_id": "echo", "name": "Echo"},
         {"voice_id": "fable", "name": "Fable"},
@@ -508,16 +711,16 @@ async def list_voices(request: Request):
     if hasattr(request.app.state, "voice_cloner") and request.app.state.voice_cloner is not None:
         cloned_voices = request.app.state.voice_cloner.list_voices()
         for voice in cloned_voices:
-            voices.append({
+            standard_voices.append({
                 "voice_id": voice.id,  # This has to be specifically voice_id
                 "name": voice.name     # This has to be specifically name
             })
     
-    logger.info(f"Listing {len(voices)} voices: {[v['name'] for v in voices]}")
-    return {"voices": voices}
+    logger.info(f"Listing {len(standard_voices)} voices")
+    return {"voices": standard_voices}
 
 # Add OpenAI-compatible models list endpoint
-@router.get("/audio/models", summary="List available audio models")
+@router.get("/audio/models", tags=["Audio"], summary="List available audio models")
 async def list_models():
     """
     OpenAI compatible endpoint that returns a list of available audio models.
@@ -534,6 +737,7 @@ async def list_models():
                 "tts": True,
                 "voice_generation": True,
                 "voice_cloning": hasattr(router.app, "voice_cloner"),
+                "streaming": True
             },
             "max_input_length": 4096,
             "price": {"text-to-speech": 0.00}
@@ -548,6 +752,7 @@ async def list_models():
             "capabilities": {
                 "tts": True,
                 "voice_generation": True,
+                "streaming": True
             },
             "max_input_length": 4096,
             "price": {"text-to-speech": 0.00}
@@ -562,6 +767,7 @@ async def list_models():
             "capabilities": {
                 "tts": True,
                 "voice_generation": True,
+                "streaming": True
             },
             "max_input_length": 4096,
             "price": {"text-to-speech": 0.00}
@@ -571,7 +777,7 @@ async def list_models():
     return {"data": models, "object": "list"}
 
 # Response format options endpoint
-@router.get("/audio/speech/response-formats", summary="List available response formats")
+@router.get("/audio/speech/response-formats", tags=["Audio"], summary="List available response formats")
 async def list_response_formats():
     """List available response formats for speech synthesis."""
     formats = [
@@ -584,14 +790,48 @@ async def list_response_formats():
     
     return {"response_formats": formats}
 
+# Streaming format options endpoint
+@router.get("/audio/speech/stream-formats", tags=["Audio"], summary="List available streaming formats")
+async def list_stream_formats():
+    """List available streaming formats for TTS."""
+    return {
+        "stream_formats": [
+            {
+                "format": "mp3", 
+                "content_type": "audio/mpeg",
+                "description": "MP3 audio format (streaming)"
+            },
+            {
+                "format": "opus", 
+                "content_type": "audio/opus",
+                "description": "Opus audio format (streaming)"
+            },
+            {
+                "format": "aac", 
+                "content_type": "audio/aac",
+                "description": "AAC audio format (streaming)"
+            },
+            {
+                "format": "flac", 
+                "content_type": "audio/flac",
+                "description": "FLAC audio format (streaming)"
+            },
+            {
+                "format": "wav", 
+                "content_type": "audio/wav",
+                "description": "WAV audio format (streaming)"
+            }
+        ]
+    }
+
 # Simple test endpoint
-@router.get("/test", summary="Test endpoint")
+@router.get("/test", tags=["Utility"], summary="Test endpoint")
 async def test_endpoint():
     """Simple test endpoint that returns a successful response."""
     return {"status": "ok", "message": "API is working"}
 
 # Debug endpoint
-@router.get("/debug", summary="Debug endpoint")
+@router.get("/debug", tags=["Utility"], summary="Debug endpoint")
 async def debug_info(request: Request):
     """Get debug information about the API."""
     generator = request.app.state.generator
@@ -628,6 +868,9 @@ async def debug_info(request: Request):
     else:
         debug_info["voice_cloning"] = {"enabled": False}
     
+    # Add streaming info
+    debug_info["streaming"] = {"enabled": True}
+    
     # Add memory usage info for CUDA
     if torch.cuda.is_available():
         debug_info["cuda"] = {
@@ -638,8 +881,34 @@ async def debug_info(request: Request):
     
     return debug_info
 
+@router.get("/voice-management/info", tags=["Voice Management"])
+async def get_voice_storage_info(request: Request):
+    """Get information about voice storage usage and status."""
+    from app.utils.voice_manager import get_voice_storage_info
+    return get_voice_storage_info()
+
+@router.post("/voice-management/backup", tags=["Voice Management"])
+async def create_voice_backup(request: Request):
+    """Create a backup of all voice data."""
+    from app.utils.voice_manager import backup_voice_data
+    backup_path = backup_voice_data()
+    return {"status": "success", "backup_path": backup_path}
+
+@router.post("/voice-management/reset-voices", tags=["Voice Management"])
+async def reset_voices(request: Request):
+    """Reset voices to their default state."""
+    from app.utils.voice_manager import restore_default_voices
+    backup_path = restore_default_voices()
+    return {"status": "success", "backup_path": backup_path, "message": "Voices reset to default state"}
+
+@router.get("/voice-management/verify-references", tags=["Voice Management"])
+async def verify_references(request: Request):
+    """Check if voice references are complete and valid."""
+    from app.utils.voice_manager import verify_voice_references
+    return verify_voice_references()
+
 # Voice diagnostics endpoint
-@router.get("/debug/voices", summary="Voice diagnostics")
+@router.get("/debug/voices", tags=["Debug"], summary="Voice diagnostics")
 async def voice_diagnostics():
     """Get diagnostic information about voice references."""
     try:
@@ -672,7 +941,7 @@ async def voice_diagnostics():
         return {"error": "Voice enhancement module not available"}
 
 # Specialized debugging endpoint for speech generation
-@router.post("/debug/speech", summary="Debug speech generation")
+@router.post("/debug/speech", tags=["Debug"], summary="Debug speech generation")
 async def debug_speech(
     request: Request,
     text: str = Body(..., embed=True),

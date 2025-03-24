@@ -1,20 +1,15 @@
 # Multi-stage build for authenticated model downloads
 FROM python:3.10-slim AS model-downloader
-
 # Install huggingface-cli
 RUN pip install huggingface_hub
-
 # Set working directory
 WORKDIR /model-downloader
-
 # Create directory for downloaded models
 RUN mkdir -p /model-downloader/models
-
 # This will run when building the image
 # You'll need to pass your Hugging Face token at build time
 ARG HF_TOKEN
 ENV HF_TOKEN=${HF_TOKEN}
-
 # Login and download model
 RUN if [ -n "$HF_TOKEN" ]; then \
     huggingface-cli login --token ${HF_TOKEN}; \
@@ -23,7 +18,6 @@ RUN if [ -n "$HF_TOKEN" ]; then \
 
 # Now for the main application stage
 FROM nvidia/cuda:12.4.0-base-ubuntu22.04
-
 # Set environment variables
 ENV PYTHONFAULTHANDLER=1 \
     PYTHONUNBUFFERED=1 \
@@ -52,6 +46,14 @@ WORKDIR /app
 
 # Copy requirements first for better caching
 COPY requirements.txt .
+
+# Create and set up persistent directories with proper permissions
+RUN mkdir -p /app/static /app/models /app/voice_memories /app/voice_references \
+    /app/voice_profiles /app/cloned_voices /app/audio_cache /app/tokenizers /app/logs && \
+    chmod -R 777 /app/voice_references /app/voice_profiles /app/voice_memories \
+    /app/cloned_voices /app/audio_cache /app/static /app/logs /app/tokenizers /app/models
+
+# Copy static files
 COPY ./static /app/static
 
 # Install Python dependencies
@@ -71,11 +73,11 @@ RUN git clone https://github.com/pytorch/torchtune.git /tmp/torchtune && \
 # Install remaining dependencies
 RUN pip3 install -r requirements.txt
 
+# Install additional dependencies for streaming and voice cloning
+RUN pip3 install yt-dlp openai-whisper
+
 # Copy application code
 COPY ./app /app/app
-
-# Create and set up models directory
-RUN mkdir -p /app/models
 
 # Copy downloaded model from the model-downloader stage
 COPY --from=model-downloader /model-downloader/models /app/models
