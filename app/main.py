@@ -9,6 +9,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import traceback
 import asyncio
+import glob
 import torch
 import uvicorn
 from contextlib import asynccontextmanager
@@ -17,12 +18,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from app.api.routes import router as api_router
+
 # Setup logging
 os.makedirs("logs", exist_ok=True)
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
 # Console handler
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter(log_format))
+
 # File handler
 file_handler = RotatingFileHandler(
     "logs/csm_tts_api.log", 
@@ -30,6 +34,7 @@ file_handler = RotatingFileHandler(
     backupCount=5
 )
 file_handler.setFormatter(logging.Formatter(log_format))
+
 # Configure root logger
 logging.basicConfig(
     level=logging.INFO,
@@ -48,17 +53,19 @@ async def lifespan(app: FastAPI):
     app.state.generator = None  # Will be populated later if model loads
     app.state.logger = logger  # Make logger available to routes
     
-    # Create necessary directories
-    os.makedirs("models", exist_ok=True)
-    os.makedirs("tokenizers", exist_ok=True)
-    os.makedirs("voice_memories", exist_ok=True)
-    os.makedirs("voice_references", exist_ok=True)
-    os.makedirs("cloned_voices", exist_ok=True)
-    os.makedirs("audio_cache", exist_ok=True)
+    # Create necessary directories - use persistent locations
+    os.makedirs("/app/models", exist_ok=True)
+    os.makedirs("/app/tokenizers", exist_ok=True)
+    os.makedirs("/app/voice_memories", exist_ok=True)
+    os.makedirs("/app/voice_references", exist_ok=True)
+    os.makedirs("/app/voice_profiles", exist_ok=True)
+    os.makedirs("/app/cloned_voices", exist_ok=True)
+    os.makedirs("/app/audio_cache", exist_ok=True)
+    os.makedirs("/app/static", exist_ok=True)
     
     # Set tokenizer cache
     try:
-        os.environ["TRANSFORMERS_CACHE"] = os.path.join(os.getcwd(), "tokenizers")
+        os.environ["TRANSFORMERS_CACHE"] = "/app/tokenizers"
         logger.info(f"Set tokenizer cache to: {os.environ['TRANSFORMERS_CACHE']}")
     except Exception as e:
         logger.error(f"Error setting tokenizer cache: {e}")
@@ -102,7 +109,7 @@ async def lifespan(app: FastAPI):
     app.state.device_map = device_map
     
     # Check if model file exists
-    model_path = os.path.join("models", "ckpt.pt")
+    model_path = os.path.join("/app/models", "ckpt.pt")
     if not os.path.exists(model_path):
         # Try to download at runtime if not present
         logger.info("Model not found. Attempting to download...")
@@ -118,7 +125,7 @@ async def lifespan(app: FastAPI):
             model_path = hf_hub_download(
                 repo_id="sesame/csm-1b", 
                 filename="ckpt.pt", 
-                local_dir="models"
+                local_dir="/app/models"
             )
             download_time = time.time() - download_start
             logger.info(f"Model downloaded to {model_path} in {download_time:.2f} seconds")
@@ -266,7 +273,8 @@ async def lifespan(app: FastAPI):
             "cloned_voices": [v.id for v in app.state.voice_cloner.list_voices()] if app.state.voice_cloning_enabled else [],
             "voice_enhancement_enabled": app.state.voice_enhancement_enabled,
             "voice_memory_enabled": app.state.voice_memory_enabled,
-            "voice_cloning_enabled": app.state.voice_cloning_enabled
+            "voice_cloning_enabled": app.state.voice_cloning_enabled,
+            "streaming_enabled": True
         }
         
         # Create a function to access all voices in a standardized format
@@ -354,7 +362,7 @@ async def lifespan(app: FastAPI):
         # Set up audio cache
         app.state.audio_cache_enabled = os.environ.get("ENABLE_AUDIO_CACHE", "true").lower() == "true"
         if app.state.audio_cache_enabled:
-            app.state.audio_cache_dir = "audio_cache"
+            app.state.audio_cache_dir = "/app/audio_cache"
             logger.info(f"Audio cache enabled, cache dir: {app.state.audio_cache_dir}")
         
         # Log GPU utilization after model loading
@@ -369,6 +377,43 @@ async def lifespan(app: FastAPI):
                     memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
                     memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)
                     logger.info(f"GPU {i}: {memory_allocated:.2f} GB allocated, {memory_reserved:.2f} GB reserved")
+        
+        # Set up scheduled tasks
+        try:
+            # Create a background task for periodic voice profile backup
+            async def periodic_voice_profile_backup(interval_hours=6):
+                """Periodically save voice profiles to persistent storage."""
+                while True:
+                    try:
+                        # Wait for the specified interval
+                        await asyncio.sleep(interval_hours * 3600)
+                        
+                        # Log the backup
+                        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                        logger.info(f"Scheduled voice profile backup started at {timestamp}")
+                        
+                        # Save voice profiles
+                        if hasattr(app.state, "voice_enhancement_enabled") and app.state.voice_enhancement_enabled:
+                            from app.voice_enhancement import save_voice_profiles
+                            save_voice_profiles()
+                            logger.info("Voice profiles saved successfully")
+                            
+                        # Save voice memories
+                        if hasattr(app.state, "voice_memory_enabled") and app.state.voice_memory_enabled:
+                            from app.voice_memory import VOICE_MEMORIES
+                            for voice_name, memory in VOICE_MEMORIES.items():
+                                memory.save()
+                            logger.info("Voice memories saved successfully")
+                            
+                    except Exception as e:
+                        logger.error(f"Error in periodic voice profile backup: {e}")
+            
+            # Start the scheduled task
+            asyncio.create_task(periodic_voice_profile_backup(interval_hours=6))
+            logger.info("Started scheduled voice profile backup task")
+            
+        except Exception as e:
+            logger.warning(f"Failed to set up scheduled tasks: {e}")
         
         logger.info(f"CSM-1B TTS API is ready on {device} with sample rate {app.state.sample_rate}")
         logger.info(f"Standard voices: {standard_voices}")
@@ -410,6 +455,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error saving voice profiles: {e}")
     
+    # Save voice memories if they've been updated
+    try:
+        if hasattr(app.state, "voice_memory_enabled") and app.state.voice_memory_enabled:
+            from app.voice_memory import VOICE_MEMORIES
+            logger.info("Saving voice memories...")
+            for voice_name, memory in VOICE_MEMORIES.items():
+                memory.save()
+            logger.info("Voice memories saved successfully")
+    except Exception as e:
+        logger.error(f"Error saving voice memories: {e}")
+    
     # Clean up any temporary files
     try:
         for temp_file in glob.glob(os.path.join(tempfile.gettempdir(), "csm_tts_*")):
@@ -441,18 +497,28 @@ app.add_middleware(
 )
 
 # Create static and other required directories
-os.makedirs("static", exist_ok=True)
-os.makedirs("cloned_voices", exist_ok=True)
+os.makedirs("/app/static", exist_ok=True)
+os.makedirs("/app/cloned_voices", exist_ok=True)
+
 # Mount the static files directory
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory="/app/static"), name="static")
+
 # Include routers
 app.include_router(api_router, prefix="/api/v1")
+
 # Add OpenAI compatible route
 app.include_router(api_router, prefix="/v1")
+
 # Add voice cloning routes
 from app.api.voice_cloning_routes import router as voice_cloning_router
 app.include_router(voice_cloning_router, prefix="/api/v1")
 app.include_router(voice_cloning_router, prefix="/v1")
+
+# Add streaming routes
+from app.api.streaming import router as streaming_router
+app.include_router(streaming_router, prefix="/api/v1")
+app.include_router(streaming_router, prefix="/v1")
+
 # Middleware for request timing
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
@@ -499,10 +565,12 @@ async def health_check(request: Request):
         "cloned_voices_count": len(cloned_voices),
         "sample_rate": getattr(request.app.state, "sample_rate", 0),
         "enhancements": "enabled" if hasattr(request.app.state, "model_info") and 
-                      request.app.state.model_info.get("enhancements_enabled", False) else "disabled",
+                      request.app.state.model_info.get("voice_enhancement_enabled", False) else "disabled",
+        "streaming": "enabled",
         "cuda": cuda_stats,
         "version": "1.0.0"
     }
+
 # Version endpoint
 @app.get("/version", include_in_schema=False)
 async def version():
@@ -512,18 +580,28 @@ async def version():
         "model_version": "CSM-1B",
         "compatible_with": "OpenAI TTS v1",
         "enhancements": "voice consistency and audio quality v1.0",
-        "voice_cloning": "enabled" if hasattr(app.state, "voice_cloner") else "disabled"
+        "voice_cloning": "enabled" if hasattr(app.state, "voice_cloner") else "disabled",
+        "streaming": "enabled"
     }
+
 # Voice cloning UI endpoint
 @app.get("/voice-cloning", include_in_schema=False)
 async def voice_cloning_ui():
     """Voice cloning UI endpoint."""
-    return FileResponse("static/voice-cloning.html")
+    return FileResponse("/app/static/voice-cloning.html")
+
+# Streaming demo endpoint
+@app.get("/streaming-demo", include_in_schema=False)
+async def streaming_demo():
+    """Streaming TTS demo endpoint."""
+    return FileResponse("/app/static/streaming-demo.html")
+
 @app.get("/", include_in_schema=False)
 async def root():
     """Root endpoint that redirects to docs."""
     logger.debug("Root endpoint accessed, redirecting to docs")
     return RedirectResponse(url="/docs")
+
 if __name__ == "__main__":
     # Get port from environment or use default
     port = int(os.environ.get("PORT", 8000))
@@ -546,6 +624,7 @@ if __name__ == "__main__":
     
     logger.info(f"Voice enhancements: {'enabled' if enable_enhancements else 'disabled'}")
     logger.info(f"Voice cloning: {'enabled' if enable_voice_cloning else 'disabled'}")
+    logger.info(f"Streaming: enabled")
     logger.info(f"Log level: {log_level}")
     
     if dev_mode:

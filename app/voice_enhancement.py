@@ -12,6 +12,14 @@ from scipy import signal
 # Setup logging
 logger = logging.getLogger(__name__)
 
+# Define persistent paths
+VOICE_REFERENCES_DIR = "/app/voice_references"
+VOICE_PROFILES_DIR = "/app/voice_profiles"
+
+# Ensure directories exist
+os.makedirs(VOICE_REFERENCES_DIR, exist_ok=True)
+os.makedirs(VOICE_PROFILES_DIR, exist_ok=True)
+
 @dataclass
 class VoiceProfile:
     """Detailed voice profile with acoustic characteristics."""
@@ -165,10 +173,8 @@ def initialize_voice_profiles():
     """
     global VOICE_PROFILES
     
-    # Try to load existing profiles from disk
-    voice_profiles_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "voice_profiles")
-    os.makedirs(voice_profiles_dir, exist_ok=True)
-    profile_path = os.path.join(voice_profiles_dir, "voice_profiles.pt")
+    # Try to load existing profiles from persistent storage
+    profile_path = os.path.join(VOICE_PROFILES_DIR, "voice_profiles.pt")
     
     if os.path.exists(profile_path):
         try:
@@ -376,12 +382,11 @@ def create_voice_segments(app_state, regenerate: bool = False):
         logger.error("Cannot create voice segments: generator not available")
         return
     
-    # Directory for voice reference segments
-    voice_refs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "voice_references")
-    os.makedirs(voice_refs_dir, exist_ok=True)
+    # Use persistent directory for voice reference segments
+    os.makedirs(VOICE_REFERENCES_DIR, exist_ok=True)
     
     for voice_name, profile in VOICE_PROFILES.items():
-        voice_dir = os.path.join(voice_refs_dir, voice_name)
+        voice_dir = os.path.join(VOICE_REFERENCES_DIR, voice_name)
         os.makedirs(voice_dir, exist_ok=True)
         
         # Check if we already have references
@@ -439,7 +444,7 @@ def create_voice_segments(app_state, regenerate: bool = False):
                     # Enhance the audio
                     audio = enhance_audio(audio, generator.sample_rate, profile)
                     
-                    # Save the reference
+                    # Save the reference to persistent storage
                     torchaudio.save(ref_path, audio.unsqueeze(0).cpu(), generator.sample_rate)
                     reference_segments.append(audio)
                     logger.info(f"Generated reference {i+1} for {voice_name}: {message}")
@@ -457,6 +462,9 @@ def create_voice_segments(app_state, regenerate: bool = False):
         if reference_segments:
             VOICE_PROFILES[voice_name].reference_segments = reference_segments
             logger.info(f"Updated {voice_name} with {len(reference_segments)} reference segments")
+    
+    # Save the updated profiles to persistent storage
+    save_voice_profiles()
 
 def get_voice_segments(voice_name: str, device: torch.device) -> List:
     """Get context segments for a given voice.
@@ -479,9 +487,8 @@ def get_voice_segments(voice_name: str, device: torch.device) -> List:
     # If we don't have reference segments yet, create them
     if not profile.reference_segments:
         try:
-            # Try to load from disk
-            voice_refs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "voice_references")
-            voice_dir = os.path.join(voice_refs_dir, voice_name)
+            # Try to load from disk - use persistent storage
+            voice_dir = os.path.join(VOICE_REFERENCES_DIR, voice_name)
             
             if os.path.exists(voice_dir):
                 reference_segments = []
@@ -519,10 +526,9 @@ def get_voice_segments(voice_name: str, device: torch.device) -> List:
     return context
 
 def save_voice_profiles():
-    """Save voice profiles to disk."""
-    voice_profiles_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "voice_profiles")
-    os.makedirs(voice_profiles_dir, exist_ok=True)
-    profile_path = os.path.join(voice_profiles_dir, "voice_profiles.pt")
+    """Save voice profiles to persistent storage."""
+    os.makedirs(VOICE_PROFILES_DIR, exist_ok=True)
+    profile_path = os.path.join(VOICE_PROFILES_DIR, "voice_profiles.pt")
     
     # Create a serializable version of the profiles
     serializable_profiles = {}
@@ -531,7 +537,7 @@ def save_voice_profiles():
             'reference_segments': [seg.cpu() for seg in profile.reference_segments]
         }
     
-    # Save to disk
+    # Save to persistent storage
     torch.save(serializable_profiles, profile_path)
     logger.info(f"Saved voice profiles to {profile_path}")
     

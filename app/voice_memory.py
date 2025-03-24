@@ -12,8 +12,8 @@ from app.models import Segment
 # Setup logging
 logger = logging.getLogger(__name__)
 
-# Path to store voice memories
-VOICE_MEMORIES_DIR = os.path.join(os.path.dirname(__file__), "voice_memories")
+# Path to store voice memories - use persistent location
+VOICE_MEMORIES_DIR = "/app/voice_memories"
 os.makedirs(VOICE_MEMORIES_DIR, exist_ok=True)
 
 @dataclass
@@ -64,7 +64,7 @@ class VoiceMemory:
             self.text_segments = self.text_segments[-max_stored:]
             
     def save(self):
-        """Save voice memory to disk."""
+        """Save voice memory to persistent storage."""
         data = {
             "name": self.name,
             "speaker_id": self.speaker_id,
@@ -74,14 +74,20 @@ class VoiceMemory:
             "timbre": self.timbre
         }
         
-        torch.save(data, os.path.join(VOICE_MEMORIES_DIR, f"{self.name}.pt"))
-        logger.info(f"Saved voice memory for {self.name}")
+        # Save to the persistent directory
+        save_path = os.path.join(VOICE_MEMORIES_DIR, f"{self.name}.pt")
+        try:
+            torch.save(data, save_path)
+            logger.info(f"Saved voice memory for {self.name} to {save_path}")
+        except Exception as e:
+            logger.error(f"Error saving voice memory for {self.name}: {e}")
         
     @classmethod
     def load(cls, name: str) -> Optional['VoiceMemory']:
-        """Load voice memory from disk."""
+        """Load voice memory from persistent storage."""
         path = os.path.join(VOICE_MEMORIES_DIR, f"{name}.pt")
         if not os.path.exists(path):
+            logger.info(f"No saved voice memory found for {name} at {path}")
             return None
             
         try:
@@ -149,7 +155,11 @@ def initialize_voices(sample_rate: int = 24000):
     """Initialize voice memories with consistent base samples."""
     global VOICE_MEMORIES
     
-    # First try to load existing memories
+    # Check if persistent directory exists, create if needed
+    os.makedirs(VOICE_MEMORIES_DIR, exist_ok=True)
+    logger.info(f"Using voice memories directory: {VOICE_MEMORIES_DIR}")
+    
+    # First try to load existing memories from persistent storage
     for voice_name in ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]:
         memory = VoiceMemory.load(voice_name)
         if memory:
@@ -197,7 +207,7 @@ def initialize_voices(sample_rate: int = 24000):
             timbre=characteristics["timbre"]
         )
         
-        # Save the voice memory
+        # Save the voice memory to persistent storage
         memory.save()
         
         # Store in dictionary
@@ -222,9 +232,9 @@ def get_voice_context(voice_name: str, device: torch.device, max_segments: int =
     return VOICE_MEMORIES["alloy"].get_context_segments(device, max_segments=max_segments)
 
 def update_voice_memory(voice_name: str, audio: torch.Tensor, text: str):
-    """Update voice memory with newly generated audio."""
+    """Update voice memory with newly generated audio and save to persistent storage."""
     if not VOICE_MEMORIES:
-        return
+        initialize_voices()
         
     if voice_name in VOICE_MEMORIES:
         VOICE_MEMORIES[voice_name].update_with_new_audio(audio, text)
@@ -244,6 +254,9 @@ def generate_voice_samples(app_state):
     
     logger.info("Beginning voice sample generation...")
     
+    # Ensure persistent directory exists
+    os.makedirs(VOICE_MEMORIES_DIR, exist_ok=True)
+    
     for voice_name in ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]:
         speaker_id = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"].index(voice_name)
         
@@ -257,6 +270,21 @@ def generate_voice_samples(app_state):
         
         for i, sample_text in enumerate(sample_texts):
             try:
+                # Check if we already have a sample
+                sample_path = os.path.join(VOICE_MEMORIES_DIR, f"{voice_name}_sample_{i}.wav")
+                if os.path.exists(sample_path):
+                    logger.info(f"Found existing sample {i+1} for {voice_name}, loading from {sample_path}")
+                    audio_tensor, sr = torchaudio.load(sample_path)
+                    if sr != generator.sample_rate:
+                        audio_tensor = torchaudio.functional.resample(
+                            audio_tensor.squeeze(0), orig_freq=sr, new_freq=generator.sample_rate
+                        )
+                    else:
+                        audio_tensor = audio_tensor.squeeze(0)
+                    audio_segments.append(audio_tensor)
+                    text_segments.append(sample_text)
+                    continue
+                    
                 # Generate without context first for seed samples
                 logger.info(f"Generating sample {i+1}/{len(sample_texts)} for {voice_name}: '{sample_text}'")
                 
@@ -274,8 +302,7 @@ def generate_voice_samples(app_state):
                 audio_segments.append(audio.detach().cpu())
                 text_segments.append(sample_text)
                 
-                # Save as WAV for reference
-                sample_path = os.path.join(VOICE_MEMORIES_DIR, f"{voice_name}_sample_{i}.wav")
+                # Save as WAV for reference to persistent storage
                 torchaudio.save(sample_path, audio.unsqueeze(0).cpu(), generator.sample_rate)
                 
                 logger.info(f"Generated sample {i+1} for {voice_name}, length: {audio.shape[0]/generator.sample_rate:.2f}s")
@@ -295,6 +322,24 @@ def generate_voice_samples(app_state):
         # Now generate a second pass with context from these samples
         if len(audio_segments) >= 2:
             try:
+                # Check if we already have a character sample
+                character_path = os.path.join(VOICE_MEMORIES_DIR, f"{voice_name}_character.wav")
+                if os.path.exists(character_path):
+                    logger.info(f"Found existing character sample for {voice_name}, loading from {character_path}")
+                    audio_tensor, sr = torchaudio.load(character_path)
+                    if sr != generator.sample_rate:
+                        audio_tensor = torchaudio.functional.resample(
+                            audio_tensor.squeeze(0), orig_freq=sr, new_freq=generator.sample_rate
+                        )
+                    else:
+                        audio_tensor = audio_tensor.squeeze(0)
+                
+                    character_sample_text = f"I'm the voice assistant known as {voice_name}. I'm designed to have a distinctive voice that you can easily recognize."
+                    VOICE_MEMORIES[voice_name].audio_segments.append(audio_tensor)
+                    VOICE_MEMORIES[voice_name].text_segments.append(character_sample_text)
+                    VOICE_MEMORIES[voice_name].save()
+                    continue
+                
                 # Get intro and conclusion prompts that build voice consistency
                 context = [
                     Segment(
@@ -317,8 +362,7 @@ def generate_voice_samples(app_state):
                     topk=30,
                 )
                 
-                # Save this comprehensive character sample
-                character_path = os.path.join(VOICE_MEMORIES_DIR, f"{voice_name}_character.wav")
+                # Save this comprehensive character sample to persistent storage
                 torchaudio.save(character_path, character_audio.unsqueeze(0).cpu(), generator.sample_rate)
                 
                 # Add this to the memory as well
@@ -357,6 +401,9 @@ def create_custom_voice(
         return {"status": "error", "message": "Generator not available"}
     
     # Check if voice already exists
+    if not VOICE_MEMORIES:
+        initialize_voices()
+        
     if name in VOICE_MEMORIES:
         return {"status": "error", "message": f"Voice '{name}' already exists"}
     
@@ -397,11 +444,11 @@ def create_custom_voice(
             timbre=timbre
         )
         
-        # Save the voice memory
+        # Save the voice memory to persistent storage
         memory.save()
         VOICE_MEMORIES[name] = memory
         
-        # Save sample as WAV for reference
+        # Save sample as WAV for reference to persistent storage
         sample_path = os.path.join(VOICE_MEMORIES_DIR, f"{name}_sample.wav")
         torchaudio.save(sample_path, audio.unsqueeze(0).cpu(), generator.sample_rate)
         
