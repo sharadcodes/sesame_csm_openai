@@ -158,6 +158,73 @@ class Generator:
         audio_tokens, audio_masks = self._tokenize_audio(segment.audio)
         return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
 
+    def generate_quick(
+        self,
+        text: str,
+        speaker: int,
+        context: List[Segment],
+        max_audio_length_ms: float = 2000,  # Short for quick generation
+        temperature: float = 0.7,  # Lower for more predictable output
+        topk: int = 20,  # Lower for faster beam selection
+    ) -> torch.Tensor:
+        """Generate audio quickly for real-time streaming."""
+        # Similar to generate() but optimized for speed
+        self._model.reset_caches()
+        
+        # Convert max_audio_length_ms to frames - limit for faster generation
+        max_audio_frames = min(int(max_audio_length_ms / 80), 128)  # Smaller limit
+        
+        # Process text
+        cleaned_text = clean_text_for_tts(text)
+        
+        # Prepare tokens
+        tokens, tokens_mask = [], []
+        # Add context segments (limited to 1 for speed)
+        if context:
+            segment_tokens, segment_tokens_mask = self._tokenize_segment(context[0])
+            tokens.append(segment_tokens)
+            tokens_mask.append(segment_tokens_mask)
+        # Add text tokens
+        gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(cleaned_text, speaker)
+        tokens.append(gen_segment_tokens)
+        tokens_mask.append(gen_segment_tokens_mask)
+        
+        prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
+        prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
+        
+        # Generate with larger batch size for fewer iterations
+        curr_tokens = prompt_tokens.unsqueeze(0)
+        curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
+        curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
+        
+        # Use larger batch size
+        batch_size = 64  # Generate more frames at once
+        all_samples = []
+        for start_idx in range(0, max_audio_frames, batch_size):
+            end_idx = min(start_idx + batch_size, max_audio_frames)
+            batch_frames = end_idx - start_idx
+            samples_batch = []
+            for i in range(batch_frames):
+                sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+                samples_batch.append(sample)
+                if torch.all(sample == 0):
+                    break
+                curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+                curr_tokens_mask = torch.cat(
+                    [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                ).unsqueeze(1)
+                curr_pos = curr_pos[:, -1:] + 1
+            all_samples.extend(samples_batch)
+            if len(samples_batch) < batch_frames:
+                break
+        
+        if not all_samples:
+            return torch.zeros(10, device=self.device)  # Return short empty audio
+            
+        # Decode audio
+        audio = self._audio_tokenizer.decode(torch.stack(all_samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
+        return audio
+
     @torch.inference_mode()
     def generate(
         self,

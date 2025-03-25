@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from app.api.schemas import SpeechRequest, ResponseFormat, Voice
 from app.models import Segment
 from app.api.streaming import AudioChunker
+from app.prompt_engineering import split_into_segments
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -208,167 +209,165 @@ async def generate_speech(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/audio/speech/stream", tags=["Audio"])
-async def stream_speech(
-    request: Request,
-    speech_request: SpeechRequest,
-):
-    """
-    Stream audio of text being spoken by a realistic voice.
-    
-    This endpoint provides an OpenAI-compatible streaming interface for TTS.
-    """
+async def stream_speech(request: Request, speech_request: SpeechRequest):
+    """Stream audio in real-time as it's being generated."""
     # Check if model is loaded
     if not hasattr(request.app.state, "generator") or request.app.state.generator is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Model not loaded. Please try again later."
-        )
-        
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     # Get request parameters
-    model = speech_request.model
     input_text = speech_request.input
     voice = speech_request.voice
     response_format = speech_request.response_format
-    speed = speech_request.speed
     temperature = speech_request.temperature
-    max_audio_length_ms = speech_request.max_audio_length_ms
     
-    # Log the request
-    logger.info(f"Streaming speech from text ({len(input_text)} chars) with voice '{voice}'")
+    logger.info(f"Real-time streaming speech from text ({len(input_text)} chars) with voice '{voice}'")
     
-    # Check if text is empty
-    if not input_text or len(input_text.strip()) == 0:
-        raise HTTPException(
-            status_code=400, 
-            detail="Input text cannot be empty"
-        )
-        
     # Get speaker ID for the voice
     speaker_id = get_speaker_id(request.app.state, voice)
     if speaker_id is None:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Voice '{voice}' not found. Available voices: {request.app.state.available_voices}"
-        )
-        
-    # Use voice memory for context
-    try:
-        # Create media type based on format
-        media_type = {
-            "mp3": "audio/mpeg",
-            "opus": "audio/opus",
-            "aac": "audio/aac",
-            "flac": "audio/flac",
-            "wav": "audio/wav",
-        }.get(response_format, "audio/mpeg")
-        
-        # Create the chunker for streaming
-        sample_rate = request.app.state.sample_rate
-        chunker = AudioChunker(sample_rate, response_format)
-        
-        # Prepare context from voice memory
-        if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
-            from app.voice_memory import get_voice_context
-            context = get_voice_context(voice, request.app.state.device)
-        else:
-            # Empty context
-            context = []
-            
-        # Check for cloned voice
-        voice_info = None
+        raise HTTPException(status_code=400, detail=f"Voice '{voice}' not found")
+
+    # Split text into very small segments for incremental generation
+    text_segments = split_into_segments(input_text, max_chars=50)  # Smaller segments for faster first response
+    logger.info(f"Split text into {len(text_segments)} segments")
+
+    # Create media type based on format
+    media_type = {
+        "mp3": "audio/mpeg",
+        "opus": "audio/opus",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+        "wav": "audio/wav",
+    }.get(response_format, "audio/mpeg")
+    
+    # For streaming, WAV works best
+    streaming_format = "wav"
+    
+    # Set up WAV header for streaming
+    sample_rate = request.app.state.sample_rate
+    
+    async def generate_streaming_audio():
+        # Get context for the voice
         if hasattr(request.app.state, "voice_cloning_enabled") and request.app.state.voice_cloning_enabled:
             voice_info = request.app.state.get_voice_info(voice)
             if voice_info and voice_info["type"] == "cloned":
                 # Use cloned voice context
-                from app.voice_cloning import VoiceCloner
                 voice_cloner = request.app.state.voice_cloner
                 context = voice_cloner.get_voice_context(voice_info["voice_id"])
-                
-        # Generate audio in a separate task to avoid blocking
-        async def generate_streaming_audio():
+            else:
+                # Standard voice
+                from app.voice_enhancement import get_voice_segments
+                context = get_voice_segments(voice, request.app.state.device)
+        else:
+            # Standard voice
+            from app.voice_enhancement import get_voice_segments
+            context = get_voice_segments(voice, request.app.state.device)
+
+        # Send WAV header immediately
+        if streaming_format == "wav":
+            # Create a WAV header for 16-bit mono audio
+            header = bytes()
+            # RIFF header
+            header += b'RIFF'
+            header += b'\x00\x00\x00\x00'  # Placeholder for file size
+            header += b'WAVE'
+            # Format chunk
+            header += b'fmt '
+            header += (16).to_bytes(4, 'little')  # Format chunk size
+            header += (1).to_bytes(2, 'little')   # PCM format
+            header += (1).to_bytes(2, 'little')   # Mono channel
+            header += (sample_rate).to_bytes(4, 'little')  # Sample rate
+            header += (sample_rate * 2).to_bytes(4, 'little')  # Byte rate
+            header += (2).to_bytes(2, 'little')   # Block align
+            header += (16).to_bytes(2, 'little')  # Bits per sample
+            # Data chunk
+            header += b'data'
+            header += b'\x00\x00\x00\x00'  # Placeholder for data size
+            yield header
+
+        # Process each segment and stream immediately
+        for i, segment_text in enumerate(text_segments):
             try:
-                # Apply optional text enhancement
-                enhanced_text = input_text
-                if hasattr(request.app.state, "prompt_templates"):
-                    from app.prompt_engineering import format_text_for_voice
-                    enhanced_text = format_text_for_voice(input_text, voice)
+                logger.info(f"Generating segment {i+1}/{len(text_segments)}")
                 
-                # Generate audio
-                if voice_info and voice_info["type"] == "cloned":
-                    # Generate with cloned voice
-                    voice_cloner = request.app.state.voice_cloner
-                    audio = voice_cloner.generate_speech(
-                        text=enhanced_text,
-                        voice_id=voice_info["voice_id"],
-                        temperature=temperature,
-                        topk=speech_request.topk or 30,
-                        max_audio_length_ms=max_audio_length_ms
-                    )
-                else:
-                    # Generate with standard voice
-                    audio = request.app.state.generator.generate(
-                        text=enhanced_text,
-                        speaker=speaker_id,
-                        context=context,
-                        max_audio_length_ms=max_audio_length_ms,
-                        temperature=temperature,
-                    )
-                
-                # Process the audio for better quality
-                if hasattr(request.app.state, "voice_enhancement_enabled") and request.app.state.voice_enhancement_enabled:
-                    from app.voice_enhancement import process_generated_audio
-                    audio = process_generated_audio(
-                        audio=audio,
-                        voice_name=voice,
-                        sample_rate=sample_rate,
-                        text=enhanced_text
-                    )
-                    
-                # Update voice memory with the new audio
-                if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
-                    from app.voice_memory import update_voice_memory
-                    update_voice_memory(voice, audio, enhanced_text)
-                    
-                # Handle speed adjustments if not 1.0
-                if speed != 1.0 and speed > 0:
-                    try:
-                        # Adjust speed using torchaudio
-                        effects = [
-                            ["tempo", str(speed)]
-                        ]
-                        audio_cpu = audio.cpu()
-                        adjusted_audio, _ = torchaudio.sox_effects.apply_effects_tensor(
-                            audio_cpu.unsqueeze(0), 
-                            sample_rate, 
-                            effects
+                # For cloned voices, use the voice cloner
+                if hasattr(request.app.state, "voice_cloning_enabled") and request.app.state.voice_cloning_enabled:
+                    voice_info = request.app.state.get_voice_info(voice)
+                    if voice_info and voice_info["type"] == "cloned":
+                        # Use cloned voice
+                        voice_cloner = request.app.state.voice_cloner
+                        segment_audio = await asyncio.to_thread(
+                            voice_cloner.generate_speech,
+                            segment_text,
+                            voice_info["voice_id"],
+                            temperature=temperature,
+                            topk=30,
+                            max_audio_length_ms=2000  # Keep it very short for fast generation
                         )
-                        audio = adjusted_audio.squeeze(0)
-                        logger.info(f"Adjusted speech speed to {speed}x")
-                    except Exception as e:
-                        logger.warning(f"Failed to adjust speech speed: {e}")
+                    else:
+                        # Use standard voice with generator
+                        segment_audio = await asyncio.to_thread(
+                            request.app.state.generator.generate,
+                            segment_text,
+                            speaker_id,
+                            context,
+                            max_audio_length_ms=2000,  # Short for quicker generation
+                            temperature=temperature
+                        )
+                else:
+                    # Use standard voice with generator
+                    segment_audio = await asyncio.to_thread(
+                        request.app.state.generator.generate,
+                        segment_text,
+                        speaker_id,
+                        context,
+                        max_audio_length_ms=2000,  # Short for quicker generation
+                        temperature=temperature
+                    )
+                
+                # Skip empty or problematic audio
+                if segment_audio is None or segment_audio.numel() == 0:
+                    logger.warning(f"Empty audio for segment {i+1}")
+                    continue
                     
-                # Stream the audio in chunks
-                async for chunk in chunker.chunk_audio(audio):
-                    yield chunk
+                # Convert to bytes and stream immediately
+                buf = io.BytesIO()
+                audio_to_save = segment_audio.unsqueeze(0) if len(segment_audio.shape) == 1 else segment_audio
+                torchaudio.save(buf, audio_to_save.cpu(), sample_rate, format=streaming_format)
+                buf.seek(0)
+                
+                # For WAV format, skip the header for all segments after the first
+                if streaming_format == "wav" and i > 0:
+                    buf.seek(44)  # Skip WAV header
                     
+                segment_bytes = buf.read()
+                yield segment_bytes
+                
+                # Update context with this segment for next generation
+                context = [
+                    Segment(
+                        text=segment_text,
+                        speaker=speaker_id,
+                        audio=segment_audio
+                    )
+                ]
+                
             except Exception as e:
-                logger.error(f"Error generating streaming audio: {e}")
-                # Send an error message - this will cause client to fail,
-                # but at least we're sending something back
-                error_message = f"Error: {str(e)}".encode()
-                yield error_message
+                logger.error(f"Error generating segment {i+1}: {e}")
+                # Continue to next segment
         
-        # Return streaming response
-        return StreamingResponse(
-            generate_streaming_audio(),
-            media_type=media_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="speech.{response_format}"'
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error in stream_speech: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generating speech: {str(e)}")
+    # Return the streaming response
+    return StreamingResponse(
+        generate_streaming_audio(),
+        media_type=media_type,
+        headers={
+            "X-Accel-Buffering": "no",  # Prevent buffering in nginx
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked"
+        }
+    )
 
 @router.post("/audio/speech/streaming", tags=["Audio"])
 async def openai_stream_speech(

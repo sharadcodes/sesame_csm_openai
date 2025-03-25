@@ -1282,34 +1282,63 @@
                 const audioPreview = document.getElementById('audio-preview');
                 
                 if (useStreaming) {
-                    // For streaming, we fetch from the streaming endpoint
-                    const response = await fetch('/v1/audio/speech/streaming', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            model: "csm-1b",
-                            input: text,
-                            voice: voiceId,
-                            response_format: "mp3",
-                            temperature: parseFloat(temperature),
-                            speed: 1.0
-                        })
-                    });
-                    
-                    if (response.ok) {
-                        const blob = await response.blob();
-                        const url = URL.createObjectURL(blob);
-                        audioPreview.src = url;
+                    // For streaming, we need to handle the response differently to play audio as it arrives
+                    try {
+                        // Reset audio element
                         audioPreview.style.display = 'block';
-                        audioPreview.play();
-                        showStatus('Speech streamed successfully', 'success');
-                        showToast('Speech streamed successfully', 'success');
-                    } else {
-                        const error = await response.json();
-                        showStatus(`Failed to stream speech: ${error.detail}`, 'error');
-                        showToast('Failed to stream speech', 'error');
+                        
+                        // Prepare the request
+                        const requestOptions = {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                model: "csm-1b",
+                                input: text,
+                                voice: voiceId,
+                                response_format: "mp3",
+                                temperature: parseFloat(temperature),
+                                speed: 1.0
+                            })
+                        };
+                        
+                        // Create a unique URL for this request to avoid caching issues
+                        const timestamp = new Date().getTime();
+                        const streamingUrl = `/v1/audio/speech/streaming?t=${timestamp}`;
+                        
+                        // Fetch from streaming endpoint
+                        const response = await fetch(streamingUrl, requestOptions);
+                        
+                        if (response.ok) {
+                            // Create a blob URL for immediate playback
+                            const blob = await response.blob();
+                            const url = URL.createObjectURL(blob);
+                            
+                            // Set the audio source and play immediately
+                            audioPreview.src = url;
+                            audioPreview.autoplay = true;
+                            
+                            // Event listeners for success/failure
+                            audioPreview.onplay = () => {
+                                showStatus('Speech streamed successfully', 'success');
+                                showToast('Speech streaming playback started', 'success');
+                            };
+                            
+                            audioPreview.onerror = (e) => {
+                                console.error('Audio playback error:', e);
+                                showStatus('Error playing streamed audio', 'error');
+                                showToast('Streaming playback error', 'error');
+                            };
+                        } else {
+                            const error = await response.json();
+                            showStatus(`Failed to stream speech: ${error.detail || 'Unknown error'}`, 'error');
+                            showToast('Failed to stream speech', 'error');
+                        }
+                    } catch (error) {
+                        console.error('Streaming error:', error);
+                        showStatus(`Error streaming speech: ${error.message}`, 'error');
+                        showToast('Error streaming speech', 'error');
                     }
                 } else {
                     // Non-streaming uses the original endpoint
