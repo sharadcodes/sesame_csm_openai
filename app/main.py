@@ -1,6 +1,6 @@
 """
-CSM-1B TTS API main application.
-Provides an OpenAI-compatible API for the CSM-1B text-to-speech model.
+TTS API main application.
+Provides an OpenAI-compatible API for various TTS models including CSM-1B and Dia-1.6B.
 """
 import os
 import time
@@ -12,6 +12,7 @@ import asyncio
 import glob
 import torch
 import uvicorn
+from enum import Enum
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,22 +20,24 @@ from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from app.api.routes import router as api_router
 
+# Define TTS Engine options
+class TTSEngine(Enum):
+    CSM = "csm"
+    DIA = "dia"
+
 # Setup logging
 os.makedirs("logs", exist_ok=True)
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-
 # Console handler
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter(log_format))
-
 # File handler
 file_handler = RotatingFileHandler(
-    "logs/csm_tts_api.log", 
+    "logs/tts_api.log", 
     maxBytes=10*1024*1024,  # 10MB
     backupCount=5
 )
 file_handler.setFormatter(logging.Formatter(log_format))
-
 # Configure root logger
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +45,7 @@ logging.basicConfig(
     handlers=[console_handler, file_handler]
 )
 logger = logging.getLogger(__name__)
-logger.info("Starting CSM-1B TTS API")
+logger.info("Starting TTS API")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -52,9 +55,14 @@ async def lifespan(app: FastAPI):
     app.state.startup_time = time.time()
     app.state.generator = None  # Will be populated later if model loads
     app.state.logger = logger  # Make logger available to routes
-    
+    # Get TTS engine choice from environment
+    tts_engine = os.environ.get("TTS_ENGINE", "csm").lower()
+    app.state.tts_engine = tts_engine
+    logger.info(f"Using TTS engine: {tts_engine}")
     # Create necessary directories - use persistent locations
     os.makedirs("/app/models", exist_ok=True)
+    os.makedirs("/app/models/csm-1b", exist_ok=True)
+    os.makedirs("/app/models/dia-1.6b", exist_ok=True)
     os.makedirs("/app/tokenizers", exist_ok=True)
     os.makedirs("/app/voice_memories", exist_ok=True)
     os.makedirs("/app/voice_references", exist_ok=True)
@@ -108,47 +116,126 @@ async def lifespan(app: FastAPI):
     app.state.device = device
     app.state.device_map = device_map
     
-    # Check if model file exists
-    model_path = os.path.join("/app/models", "ckpt.pt")
-    if not os.path.exists(model_path):
-        # Try to download at runtime if not present
-        logger.info("Model not found. Attempting to download...")
-        try:
-            from huggingface_hub import hf_hub_download, login
-            # Check for token in environment
-            hf_token = os.environ.get("HF_TOKEN")
-            if hf_token:
-                logger.info("Logging in to Hugging Face using provided token")
-                login(token=hf_token)
-            logger.info("Downloading CSM-1B model from Hugging Face...")
-            download_start = time.time()
-            model_path = hf_hub_download(
-                repo_id="sesame/csm-1b", 
-                filename="ckpt.pt", 
-                local_dir="/app/models"
-            )
-            download_time = time.time() - download_start
-            logger.info(f"Model downloaded to {model_path} in {download_time:.2f} seconds")
-        except Exception as e:
-            error_stack = traceback.format_exc()
-            logger.error(f"Error downloading model: {str(e)}\n{error_stack}")
-            logger.error("Please build the image with HF_TOKEN to download the model")
-            logger.error("Starting without model - API will return 503 Service Unavailable")
-    else:
-        logger.info(f"Found existing model at {model_path}")
-        logger.info(f"Model size: {os.path.getsize(model_path) / (1024 * 1024):.2f} MB")
+    # Define standard voices
+    standard_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
     
-    # Load the model
+    # Load appropriate model based on TTS engine selection
     try:
-        logger.info("Loading CSM-1B model...")
+        logger.info(f"Loading {tts_engine.upper()} TTS model...")
         load_start = time.time()
-        from app.generator import load_csm_1b
-        app.state.generator = load_csm_1b(model_path, device, device_map)
+        
+        if tts_engine == "dia":
+            # Load Dia model from downloaded files
+            from dia.model import Dia
+            from app.dia_adapter import DiaAdapter
+            
+            config_path = os.path.join("/app/models/dia-1.6b", "config.json")
+            checkpoint_path = os.path.join("/app/models/dia-1.6b", "dia-v0_1.pth")
+            
+            if not os.path.exists(config_path) or not os.path.exists(checkpoint_path):
+                logger.warning("Dia model files not found at expected paths. Attempting to download...")
+                try:
+                    from huggingface_hub import hf_hub_download, login
+                    # Check for token in environment
+                    hf_token = os.environ.get("HF_TOKEN")
+                    if hf_token:
+                        logger.info("Logging in to Hugging Face using provided token")
+                        login(token=hf_token)
+                    
+                    # Download Dia model files
+                    logger.info("Downloading Dia model files from Hugging Face...")
+                    download_start = time.time()
+                    config_path = hf_hub_download(
+                        repo_id="nari-labs/Dia-1.6B", 
+                        filename="config.json", 
+                        local_dir="/app/models/dia-1.6b"
+                    )
+                    checkpoint_path = hf_hub_download(
+                        repo_id="nari-labs/Dia-1.6B", 
+                        filename="dia-v0_1.pth", 
+                        local_dir="/app/models/dia-1.6b"
+                    )
+                    download_time = time.time() - download_start
+                    logger.info(f"Downloaded Dia model files to {config_path} and {checkpoint_path} in {download_time:.2f} seconds")
+                except Exception as e:
+                    error_stack = traceback.format_exc()
+                    logger.error(f"Error downloading Dia model: {str(e)}\n{error_stack}")
+                    logger.error("Starting without model - API will return 503 Service Unavailable")
+                    app.state.generator = None
+                    yield
+                    return
+            
+            # Load Dia from downloaded files
+            try:
+                logger.info(f"Loading Dia model from local files: {config_path} and {checkpoint_path}")
+                dia_model = Dia.from_local(config_path, checkpoint_path, device=torch.device(device))
+                app.state.generator = DiaAdapter(dia_model)
+                app.state.sample_rate = 44100  # Dia uses 44.1kHz
+                app.state.is_dia = True
+                logger.info("Dia model loaded successfully from local files")
+            except Exception as e:
+                error_stack = traceback.format_exc()
+                logger.error(f"Error loading Dia model from local files: {str(e)}\n{error_stack}")
+                # Fallback to loading from HF
+                try:
+                    logger.info("Attempting to load Dia directly from Hugging Face...")
+                    dia_model = Dia.from_pretrained("nari-labs/Dia-1.6B", device=torch.device(device))
+                    app.state.generator = DiaAdapter(dia_model)
+                    app.state.sample_rate = 44100
+                    app.state.is_dia = True
+                    logger.info("Dia model loaded successfully from Hugging Face")
+                except Exception as fallback_e:
+                    logger.error(f"Fallback loading also failed: {fallback_e}")
+                    logger.error("Starting without model - API will return 503 Service Unavailable")
+                    app.state.generator = None
+                    yield
+                    return
+        else:
+            # Load CSM model (default)
+            # Check if model file exists
+            model_path = os.path.join("/app/models/csm-1b", "ckpt.pt")
+            if not os.path.exists(model_path):
+                # Try to download at runtime if not present
+                logger.info("CSM model not found at expected path. Attempting to download...")
+                try:
+                    from huggingface_hub import hf_hub_download, login
+                    # Check for token in environment
+                    hf_token = os.environ.get("HF_TOKEN")
+                    if hf_token:
+                        logger.info("Logging in to Hugging Face using provided token")
+                        login(token=hf_token)
+                    logger.info("Downloading CSM-1B model from Hugging Face...")
+                    download_start = time.time()
+                    model_path = hf_hub_download(
+                        repo_id="sesame/csm-1b", 
+                        filename="ckpt.pt", 
+                        local_dir="/app/models/csm-1b"
+                    )
+                    download_time = time.time() - download_start
+                    logger.info(f"Model downloaded to {model_path} in {download_time:.2f} seconds")
+                except Exception as e:
+                    error_stack = traceback.format_exc()
+                    logger.error(f"Error downloading model: {str(e)}\n{error_stack}")
+                    logger.error("Please build the image with HF_TOKEN to download the model")
+                    logger.error("Starting without model - API will return 503 Service Unavailable")
+                    app.state.generator = None
+                    yield
+                    return
+            else:
+                logger.info(f"Found existing CSM model at {model_path}")
+                logger.info(f"Model size: {os.path.getsize(model_path) / (1024 * 1024):.2f} MB")
+                
+            # Load the CSM model
+            from app.generator import load_csm_1b
+            app.state.generator = load_csm_1b(model_path, device, device_map)
+            app.state.sample_rate = app.state.generator.sample_rate
+            app.state.is_dia = False
+            logger.info("CSM model loaded successfully")
+            
         load_time = time.time() - load_start
         logger.info(f"Model loaded successfully in {load_time:.2f} seconds")
         
         # Store sample rate in app state
-        app.state.sample_rate = app.state.generator.sample_rate
         logger.info(f"Model sample rate: {app.state.sample_rate} Hz")
         
         # Initialize voice enhancement system (this will create proper voice profiles)
@@ -183,19 +270,15 @@ async def lifespan(app: FastAPI):
             app.state.cloned_voices_dir = "/app/cloned_voices"  # Store path in app state for access
             os.makedirs(app.state.cloned_voices_dir, exist_ok=True)
             CLONED_VOICES_DIR = app.state.cloned_voices_dir  # Update the module constant
-            
             # Initialize the voice cloner with proper device
             app.state.voice_cloner = VoiceCloner(app.state.generator, device=device)
-            
             # Make sure existing voices are loaded
             app.state.voice_cloner._load_existing_voices()
-            
             # Log the available voices
             cloned_voices = app.state.voice_cloner.list_voices()
             logger.info(f"Voice cloning system initialized with {len(cloned_voices)} existing voices")
             for voice in cloned_voices:
                 logger.info(f"  - {voice.name} (ID: {voice.id}, Speaker ID: {voice.speaker_id})")
-            
             # Flag for voice cloning availability
             app.state.voice_cloning_enabled = True
         except Exception as e:
@@ -231,9 +314,7 @@ async def lifespan(app: FastAPI):
         
         # Initialize voice cache for all voices (standard + cloned)
         app.state.voice_cache = {}
-        
         # Add standard voices
-        standard_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
         for voice in standard_voices:
             app.state.voice_cache[voice] = []
         
@@ -256,6 +337,17 @@ async def lifespan(app: FastAPI):
                 app.state.voice_speaker_map[voice.name] = voice.speaker_id
                 app.state.voice_speaker_map[str(voice.speaker_id)] = voice.speaker_id
         
+        # Update clone speaker IDs to ensure compatibility with both engines
+        # This must come AFTER creating voice_speaker_map and adding cloned voices to it
+        if app.state.voice_cloning_enabled and hasattr(app.state, "voice_cloner") and app.state.tts_engine == "dia":
+            logger.info("Adapting cloned voices for Dia compatibility...")
+            for voice in app.state.voice_cloner.list_voices():
+                # Ensure speaker IDs are either 0 (S1) or 1 (S2) for Dia
+                adjusted_id = voice.speaker_id % 2
+                app.state.voice_speaker_map[voice.id] = adjusted_id
+                app.state.voice_speaker_map[voice.name] = adjusted_id
+                logger.info(f"  - Mapped voice '{voice.name}' to Dia speaker {adjusted_id+1}")
+        
         # Compile voice information for API
         app.state.available_voices = standard_voices.copy()
         if app.state.voice_cloning_enabled and hasattr(app.state, "voice_cloner"):
@@ -265,7 +357,8 @@ async def lifespan(app: FastAPI):
         
         # Store model information for API endpoints
         app.state.model_info = {
-            "name": "CSM-1B",
+            "name": "Dia-1.6B" if tts_engine == "dia" else "CSM-1B",
+            "tts_engine": tts_engine,
             "device": device,
             "device_map": device_map,
             "sample_rate": app.state.sample_rate,
@@ -289,7 +382,6 @@ async def lifespan(app: FastAPI):
                 {"voice_id": "nova", "name": "Nova", "description": "Warm and smooth"},
                 {"voice_id": "shimmer", "name": "Shimmer", "description": "Light and airy"}
             ]
-            
             # Add cloned voices if available
             if app.state.voice_cloning_enabled and hasattr(app.state, "voice_cloner"):
                 for voice in app.state.voice_cloner.list_voices():
@@ -298,7 +390,6 @@ async def lifespan(app: FastAPI):
                         "name": voice.name,
                         "description": voice.description or f"Cloned voice: {voice.name}"
                     })
-            
             return all_voices
         
         app.state.get_all_voices = get_all_available_voices
@@ -318,7 +409,7 @@ async def lifespan(app: FastAPI):
             # Look for cloned voice
             if not app.state.voice_cloning_enabled or not hasattr(app.state, "voice_cloner"):
                 return None
-                
+            
             # Check by ID
             if voice_identifier in app.state.voice_cloner.cloned_voices:
                 voice = app.state.voice_cloner.cloned_voices[voice_identifier]
@@ -328,7 +419,7 @@ async def lifespan(app: FastAPI):
                     "name": voice.name,
                     "speaker_id": voice.speaker_id
                 }
-                
+            
             # Check by name
             for v_id, voice in app.state.voice_cloner.cloned_voices.items():
                 if voice.name == voice_identifier:
@@ -338,7 +429,7 @@ async def lifespan(app: FastAPI):
                         "name": voice.name,
                         "speaker_id": voice.speaker_id
                     }
-                    
+            
             # Check by speaker_id (string representation)
             try:
                 speaker_id = int(voice_identifier)
@@ -353,10 +444,10 @@ async def lifespan(app: FastAPI):
                         }
             except (ValueError, TypeError):
                 pass
-                
+            
             # No match found
             return None
-            
+        
         app.state.get_voice_info = get_voice_info
         
         # Set up audio cache
@@ -370,7 +461,6 @@ async def lifespan(app: FastAPI):
             memory_allocated = torch.cuda.memory_allocated() / (1024**3)
             memory_reserved = torch.cuda.memory_reserved() / (1024**3)
             logger.info(f"GPU memory: {memory_allocated:.2f} GB allocated, {memory_reserved:.2f} GB reserved")
-            
             if torch.cuda.device_count() > 1 and device_map:
                 logger.info("Multi-GPU setup active with the following memory usage:")
                 for i in range(torch.cuda.device_count()):
@@ -387,39 +477,33 @@ async def lifespan(app: FastAPI):
                     try:
                         # Wait for the specified interval
                         await asyncio.sleep(interval_hours * 3600)
-                        
                         # Log the backup
                         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                         logger.info(f"Scheduled voice profile backup started at {timestamp}")
-                        
                         # Save voice profiles
                         if hasattr(app.state, "voice_enhancement_enabled") and app.state.voice_enhancement_enabled:
                             from app.voice_enhancement import save_voice_profiles
                             save_voice_profiles()
                             logger.info("Voice profiles saved successfully")
-                            
                         # Save voice memories
                         if hasattr(app.state, "voice_memory_enabled") and app.state.voice_memory_enabled:
                             from app.voice_memory import VOICE_MEMORIES
                             for voice_name, memory in VOICE_MEMORIES.items():
                                 memory.save()
                             logger.info("Voice memories saved successfully")
-                            
                     except Exception as e:
                         logger.error(f"Error in periodic voice profile backup: {e}")
             
             # Start the scheduled task
             asyncio.create_task(periodic_voice_profile_backup(interval_hours=6))
             logger.info("Started scheduled voice profile backup task")
-            
         except Exception as e:
             logger.warning(f"Failed to set up scheduled tasks: {e}")
         
-        logger.info(f"CSM-1B TTS API is ready on {device} with sample rate {app.state.sample_rate}")
+        logger.info(f"{tts_engine.upper()} TTS API is ready on {device} with sample rate {app.state.sample_rate}")
         logger.info(f"Standard voices: {standard_voices}")
         cloned_count = len(app.state.voice_cloner.list_voices()) if app.state.voice_cloning_enabled else 0
         logger.info(f"Cloned voices: {cloned_count}")
-        
     except Exception as e:
         error_stack = traceback.format_exc()
         logger.error(f"Error loading model: {str(e)}\n{error_stack}")
@@ -481,8 +565,8 @@ async def lifespan(app: FastAPI):
     
 # Initialize FastAPI app
 app = FastAPI(
-    title="CSM-1B TTS API",
-    description="OpenAI-compatible TTS API using the CSM-1B model from Sesame",
+    title="TTS API",
+    description="OpenAI-compatible TTS API supporting multiple models (CSM-1B and Dia-1.6B)",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -505,7 +589,6 @@ app.mount("/static", StaticFiles(directory="/app/static"), name="static")
 
 # Include routers
 app.include_router(api_router, prefix="/api/v1")
-
 # Add OpenAI compatible route
 app.include_router(api_router, prefix="/v1")
 
@@ -536,11 +619,13 @@ async def health_check(request: Request):
     """Health check endpoint that returns the status of the API."""
     model_status = "healthy" if hasattr(request.app.state, "generator") and request.app.state.generator is not None else "unhealthy"
     uptime = time.time() - getattr(request.app.state, "startup_time", time.time())
+    
+    # Add TTS engine info
+    tts_engine = getattr(request.app.state, "tts_engine", "csm")
 
     # Get voice information
     standard_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
     cloned_voices = []
-    
     if hasattr(request.app.state, "voice_cloner") and request.app.state.voice_cloner is not None:
         cloned_voices = [
             {"id": v.id, "name": v.name, "speaker_id": v.speaker_id}
@@ -559,7 +644,8 @@ async def health_check(request: Request):
         "status": model_status,
         "uptime": f"{uptime:.2f} seconds",
         "device": getattr(request.app.state, "device", "unknown"),
-        "model": "CSM-1B",
+        "model": "Dia-1.6B" if tts_engine == "dia" else "CSM-1B",
+        "tts_engine": tts_engine,
         "standard_voices": standard_voices,
         "cloned_voices": cloned_voices,
         "cloned_voices_count": len(cloned_voices),
@@ -573,11 +659,14 @@ async def health_check(request: Request):
 
 # Version endpoint
 @app.get("/version", include_in_schema=False)
-async def version():
+async def version(request: Request):
     """Version endpoint that returns API version information."""
+    tts_engine = getattr(request.app.state, "tts_engine", "csm")
+    
     return {
         "api_version": "1.0.0",
-        "model_version": "CSM-1B",
+        "model_version": "Dia-1.6B" if tts_engine == "dia" else "CSM-1B",
+        "tts_engine": tts_engine,
         "compatible_with": "OpenAI TTS v1",
         "enhancements": "voice consistency and audio quality v1.0",
         "voice_cloning": "enabled" if hasattr(app.state, "voice_cloner") else "disabled",
@@ -596,6 +685,27 @@ async def streaming_demo():
     """Streaming TTS demo endpoint."""
     return FileResponse("/app/static/streaming-demo.html")
 
+@app.get("/models", include_in_schema=False)
+async def available_models():
+    """List available TTS models."""
+    return {
+        "models": [
+            {
+                "id": "csm-1b",
+                "name": "CSM-1B",
+                "version": "1.0",
+                "description": "Conversational Speech Model 1B from Sesame"
+            },
+            {
+                "id": "dia-1.6b",
+                "name": "Dia-1.6B",
+                "version": "1.0",
+                "description": "Dialogue Speech Model 1.6B from Nari Labs"
+            }
+        ],
+        "current_model": os.environ.get("TTS_ENGINE", "csm")
+    }
+
 @app.get("/", include_in_schema=False)
 async def root():
     """Root endpoint that redirects to docs."""
@@ -605,10 +715,8 @@ async def root():
 if __name__ == "__main__":
     # Get port from environment or use default
     port = int(os.environ.get("PORT", 8000))
-    
     # Development mode flag
     dev_mode = os.environ.get("DEV_MODE", "false").lower() == "true"
-    
     # Log level (default to INFO, but can be overridden)
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.getLogger().setLevel(log_level)
@@ -622,6 +730,9 @@ if __name__ == "__main__":
     if not enable_voice_cloning:
         logger.warning("Voice cloning disabled by environment variable")
     
+    # Get TTS engine
+    tts_engine = os.environ.get("TTS_ENGINE", "csm").lower()
+    logger.info(f"TTS engine: {tts_engine}")
     logger.info(f"Voice enhancements: {'enabled' if enable_enhancements else 'disabled'}")
     logger.info(f"Voice cloning: {'enabled' if enable_voice_cloning else 'disabled'}")
     logger.info(f"Streaming: enabled")

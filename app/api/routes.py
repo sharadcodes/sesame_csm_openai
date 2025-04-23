@@ -73,9 +73,7 @@ async def generate_speech(
 ):
     """
     Generate audio of text being spoken by a realistic voice.
-    
     This endpoint is compatible with the OpenAI TTS API.
-    
     For streaming responses, use `/v1/audio/speech/streaming` instead.
     """
     # Check if model is available
@@ -95,20 +93,37 @@ async def generate_speech(
     logger.info(f"TTS request: text length={len(input_text)}, voice={voice}, format={response_format}")
     
     try:
-        # Get speaker ID for the voice
-        speaker_id = get_speaker_id(request.app.state, voice)
+        # Get speaker ID for the voice - with Dia-specific handling
+        if hasattr(request.app.state, "is_dia") and request.app.state.is_dia:
+            # Dia has a different speaker system with only two options: S1 and S2
+            # Map voices to either speaker 0 (S1) or 1 (S2) for Dia
+            if voice.lower() in ["echo", "onyx", "shimmer"]:
+                speaker_id = 1  # S2
+            else:
+                speaker_id = 0  # S1
+                
+            # For cloned voices with Dia, we map to either 0 or 1
+            if hasattr(request.app.state, "voice_speaker_map") and voice in request.app.state.voice_speaker_map:
+                original_speaker_id = request.app.state.voice_speaker_map[voice]
+                # Maps to either S1 or S2 based on odd/even
+                speaker_id = original_speaker_id % 2
+                
+            logger.info(f"Using Dia speaker mapping: {voice} -> Speaker {speaker_id+1}")
+        else:
+            # Standard CSM speaker mapping
+            speaker_id = get_speaker_id(request.app.state, voice)
+            
         if speaker_id is None:
             raise HTTPException(status_code=400, detail=f"Voice '{voice}' not found")
-        
+    
         # Check if this is a cloned voice
         voice_info = None
         cloned_voice_id = None
-        
         if hasattr(request.app.state, "get_voice_info"):
             voice_info = request.app.state.get_voice_info(voice)
             if voice_info and voice_info["type"] == "cloned":
                 cloned_voice_id = voice_info["voice_id"]
-                
+        
         # Generate audio based on whether it's a standard or cloned voice
         if cloned_voice_id is not None and hasattr(request.app.state, "voice_cloner"):
             # Generate speech with cloned voice
@@ -132,18 +147,27 @@ async def generate_speech(
                 )
         else:
             # Generate speech with standard voice
-            # Use voice context from memory if enabled
-            if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
+            tts_engine = getattr(request.app.state, "tts_engine", "csm")
+            
+            # Use voice context from memory if enabled and if not using Dia
+            if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled and tts_engine != "dia":
                 from app.voice_memory import get_voice_context
                 context = get_voice_context(voice, torch.device(request.app.state.device))
             else:
                 context = []
             
             # Apply optional text enhancement for better voice consistency
+            # For Dia model, we'll skip prompt engineering since it has its own format
             enhanced_text = input_text
-            if hasattr(request.app.state, "prompt_templates"):
+            if hasattr(request.app.state, "prompt_templates") and tts_engine != "dia":
                 from app.prompt_engineering import format_text_for_voice
                 enhanced_text = format_text_for_voice(input_text, voice)
+            
+            # Special handling for Dia model which requires S1/S2 tags
+            if tts_engine == "dia" and not enhanced_text.strip().startswith("[S"):
+                # Add appropriate speaker tag [S1] or [S2]
+                enhanced_text = f"[S{speaker_id+1}] {enhanced_text}"
+                logger.info(f"Added Dia speaker tag: {enhanced_text[:10]}...")
             
             # Generate audio
             audio = request.app.state.generator.generate(
@@ -156,8 +180,8 @@ async def generate_speech(
             )
             sample_rate = request.app.state.sample_rate
             
-            # Process audio for better quality
-            if hasattr(request.app.state, "voice_enhancement_enabled") and request.app.state.voice_enhancement_enabled:
+            # Process audio for better quality - skip for Dia as it has its own processing
+            if tts_engine != "dia" and hasattr(request.app.state, "voice_enhancement_enabled") and request.app.state.voice_enhancement_enabled:
                 from app.voice_enhancement import process_generated_audio
                 audio = process_generated_audio(
                     audio=audio,
@@ -166,8 +190,8 @@ async def generate_speech(
                     text=input_text
                 )
             
-            # Update voice memory if enabled
-            if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
+            # Update voice memory if enabled and not using Dia
+            if tts_engine != "dia" and hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
                 from app.voice_memory import update_voice_memory
                 update_voice_memory(voice, audio, input_text)
         
@@ -203,7 +227,6 @@ async def generate_speech(
             media_type=content_type,
             headers={"Content-Disposition": f"attachment; filename=speech.{response_format}"}
         )
-                
     except Exception as e:
         logger.error(f"Error in text_to_speech: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -386,13 +409,11 @@ async def openai_stream_speech(
 async def format_audio(audio, response_format, sample_rate, app_state):
     """
     Format audio according to requested format.
-    
     Args:
         audio: Audio tensor from TTS generation
         response_format: Format as string or enum ('mp3', 'opus', 'aac', 'flac', 'wav')
         sample_rate: Sample rate of the audio
         app_state: FastAPI app state with config and cache settings
-    
     Returns:
         Tuple of (response_data, content_type)
     """
@@ -403,14 +424,16 @@ async def format_audio(audio, response_format, sample_rate, app_state):
     import os
     import hashlib
     import time
+    import subprocess
+    import logging
+    
+    logger = logging.getLogger(__name__)
     
     # Handle enum or string for response_format
     if hasattr(response_format, 'value'):
         response_format = response_format.value
-    
     # Normalize response_format to lowercase
     response_format = str(response_format).lower()
-    
     # Map formats to content types
     format_to_content_type = {
         'mp3': 'audio/mpeg',
@@ -419,7 +442,6 @@ async def format_audio(audio, response_format, sample_rate, app_state):
         'flac': 'audio/flac',
         'wav': 'audio/wav'
     }
-    
     # Ensure response format is supported
     if response_format not in format_to_content_type:
         logger.warning(f"Unsupported format: {response_format}, defaulting to mp3")
@@ -428,7 +450,6 @@ async def format_audio(audio, response_format, sample_rate, app_state):
     # Generate a cache key based on audio content and format
     cache_enabled = getattr(app_state, "audio_cache_enabled", False)
     cache_key = None
-    
     if cache_enabled:
         # Generate a hash of the audio tensor for caching
         audio_hash = hashlib.md5(audio.cpu().numpy().tobytes()).hexdigest()
@@ -436,7 +457,6 @@ async def format_audio(audio, response_format, sample_rate, app_state):
         cache_dir = getattr(app_state, "audio_cache_dir", "/app/audio_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = os.path.join(cache_dir, f"{cache_key}")
-        
         # Check if we have a cache hit
         if os.path.exists(cache_path):
             try:
@@ -449,7 +469,6 @@ async def format_audio(audio, response_format, sample_rate, app_state):
     
     # Process audio to the required format
     start_time = time.time()
-    
     # Move audio to CPU before saving
     audio_cpu = audio.cpu()
     
@@ -461,65 +480,34 @@ async def format_audio(audio, response_format, sample_rate, app_state):
                 # Direct save for WAV
                 torchaudio.save(temp_path, audio_cpu.unsqueeze(0), sample_rate)
             else:
-                # For other formats, first save as WAV then convert
+                # For other formats, first save as WAV then convert using ffmpeg directly
                 wav_path = f"{temp_path}.wav"
                 torchaudio.save(wav_path, audio_cpu.unsqueeze(0), sample_rate)
                 
-                # Use ffmpeg via torchaudio for conversion
-                if hasattr(torchaudio.backend, 'sox_io_backend'):  # New torchaudio structure
-                    if response_format == 'mp3':
-                        # For MP3, use higher quality
-                        sox_effects = torchaudio.sox_effects.SoxEffectsChain()
-                        sox_effects.set_input_file(wav_path)
-                        sox_effects.append_effect_to_chain(["rate", f"{sample_rate}"])
-                        # Higher bitrate for better quality
-                        sox_effects.append_effect_to_chain(["gain", "-n"])  # Normalize
-                        out, _ = sox_effects.sox_build_flow_effects()
-                        torchaudio.save(temp_path, out, sample_rate, format="mp3", compression=128)
-                    elif response_format == 'opus':
-                        # Use ffmpeg for opus through a system call
-                        import subprocess
-                        subprocess.run([
-                            "ffmpeg", "-i", wav_path, "-c:a", "libopus", 
-                            "-b:a", "64k", "-vbr", "on", temp_path,
-                            "-y", "-loglevel", "error"
-                        ], check=True)
-                    elif response_format == 'aac':
-                        # Use ffmpeg for AAC through a system call
-                        import subprocess
-                        subprocess.run([
-                            "ffmpeg", "-i", wav_path, "-c:a", "aac", 
-                            "-b:a", "128k", temp_path,
-                            "-y", "-loglevel", "error"
-                        ], check=True)
-                    elif response_format == 'flac':
-                        torchaudio.save(temp_path, audio_cpu.unsqueeze(0), sample_rate, format="flac")
-                else:
-                    # Fallback using external command
-                    import subprocess
-                    if response_format == 'mp3':
-                        subprocess.run([
-                            "ffmpeg", "-i", wav_path, "-codec:a", "libmp3lame", 
-                            "-qscale:a", "2", temp_path,
-                            "-y", "-loglevel", "error"
-                        ], check=True)
-                    elif response_format == 'opus':
-                        subprocess.run([
-                            "ffmpeg", "-i", wav_path, "-c:a", "libopus", 
-                            "-b:a", "64k", "-vbr", "on", temp_path,
-                            "-y", "-loglevel", "error"
-                        ], check=True)
-                    elif response_format == 'aac':
-                        subprocess.run([
-                            "ffmpeg", "-i", wav_path, "-c:a", "aac", 
-                            "-b:a", "128k", temp_path,
-                            "-y", "-loglevel", "error"
-                        ], check=True)
-                    elif response_format == 'flac':
-                        subprocess.run([
-                            "ffmpeg", "-i", wav_path, "-c:a", "flac", temp_path,
-                            "-y", "-loglevel", "error"
-                        ], check=True)
+                # Use ffmpeg for conversion (more reliable than torchaudio for some formats)
+                if response_format == 'mp3':
+                    subprocess.run([
+                        "ffmpeg", "-i", wav_path, "-codec:a", "libmp3lame", 
+                        "-qscale:a", "2", temp_path,
+                        "-y", "-loglevel", "error"
+                    ], check=True)
+                elif response_format == 'opus':
+                    subprocess.run([
+                        "ffmpeg", "-i", wav_path, "-c:a", "libopus", 
+                        "-b:a", "64k", "-vbr", "on", temp_path,
+                        "-y", "-loglevel", "error"
+                    ], check=True)
+                elif response_format == 'aac':
+                    subprocess.run([
+                        "ffmpeg", "-i", wav_path, "-c:a", "aac", 
+                        "-b:a", "128k", temp_path,
+                        "-y", "-loglevel", "error"
+                    ], check=True)
+                elif response_format == 'flac':
+                    subprocess.run([
+                        "ffmpeg", "-i", wav_path, "-c:a", "flac", temp_path,
+                        "-y", "-loglevel", "error"
+                    ], check=True)
                 
                 # Clean up the temporary WAV file
                 try:
@@ -544,9 +532,7 @@ async def format_audio(audio, response_format, sample_rate, app_state):
             # Log processing time
             processing_time = time.time() - start_time
             logger.info(f"Processed audio to {response_format} in {processing_time:.3f}s")
-            
             return response_data, format_to_content_type[response_format]
-        
         except Exception as e:
             logger.error(f"Error converting audio to {response_format}: {e}")
             # Fallback to WAV if conversion fails
@@ -560,14 +546,13 @@ async def format_audio(audio, response_format, sample_rate, app_state):
             except Exception as fallback_error:
                 logger.error(f"Fallback to WAV also failed: {fallback_error}")
                 raise RuntimeError(f"Failed to generate audio in any format: {str(e)}")
-        
         finally:
             # Clean up the temporary file
             try:
                 os.unlink(temp_path)
             except:
                 pass
-
+                
 @router.post("/audio/conversation", tags=["Conversation API"])
 async def conversation_to_speech(
     request: Request,

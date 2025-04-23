@@ -832,3 +832,28 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: st
         import traceback
         logger.error(traceback.format_exc())
         raise
+
+def load_dia_model(device: str = "cuda") -> "Generator":
+    """
+    Load Dia model with adapter for CSM-compatible interface.
+    
+    Args:
+        device: Device to load model on ('cuda', 'cpu')
+        
+    Returns:
+        Generator-like adapter for Dia model
+    """
+    try:
+        # Import Dia model
+        from dia.model import Dia
+        from app.dia_adapter import DiaAdapter
+        
+        # Load Dia model
+        logger.info(f"Loading Dia model on device {device}")
+        dia_model = Dia.from_pretrained("nari-labs/Dia-1.6B", device=torch.device(device))
+        
+        # Wrap with adapter
+        return DiaAdapter(dia_model)
+    except Exception as e:
+        logger.error(f"Error loading Dia model: {e}")
+        raise RuntimeError(f"Failed to load Dia model: {e}")

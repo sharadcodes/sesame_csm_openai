@@ -5,8 +5,9 @@ services:
       dockerfile: Dockerfile
       args:
         - HF_TOKEN=${HF_TOKEN}
+        - TTS_ENGINE=${TTS_ENGINE:-csm}
     ports:
-      - "8000:8000"
+      - "8999:8000"
     volumes:
       - ./models:/app/models
       - ./cloned_voices:/app/cloned_voices
@@ -14,6 +15,7 @@ services:
       - ./voice_profiles:/app/voice_profiles    
     environment:
       - HF_TOKEN=${HF_TOKEN}  
+      - TTS_ENGINE=${TTS_ENGINE:-csm}  # Default to CSM if not specified
     deploy:
       resources:
         reservations:

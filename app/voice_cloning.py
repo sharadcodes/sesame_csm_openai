@@ -491,7 +491,7 @@ class VoiceCloner:
         return False
 
     async def clone_voice_from_youtube(
-        self,  # Don't forget the self parameter for class methods
+        self,
         youtube_url: str,
         voice_name: str,
         start_time: int = 0,
@@ -500,14 +500,12 @@ class VoiceCloner:
     ) -> ClonedVoice:
         """
         Clone a voice from a YouTube video.
-        
         Args:
             youtube_url: URL of the YouTube video
             voice_name: Name for the cloned voice
             start_time: Start time in seconds
             duration: Duration to extract in seconds
             description: Optional description of the voice
-            
         Returns:
             ClonedVoice object with voice information
         """
@@ -530,7 +528,7 @@ class VoiceCloner:
             )
             
             return voice
-
+            
     async def _download_youtube_audio(
         self,  # Don't forget the self parameter
         url: str, 
@@ -624,77 +622,115 @@ class VoiceCloner:
         Returns:
             Generated audio tensor
         """
-        # Remove any async/await keywords - this is a synchronous function
         if voice_id not in self.cloned_voices:
             raise ValueError(f"Voice ID {voice_id} not found")
+            
         voice = self.cloned_voices[voice_id]
         context = self.get_voice_context(voice_id)
+        
         if not context:
             raise ValueError(f"Could not get context for voice {voice_id}")
+            
+        # Detect if we're using Dia or CSM
+        is_dia = hasattr(self.generator, 'dia_model')
+        
         # Preprocess text for better pronunciation
         processed_text = self._preprocess_text(text)
         logger.info(f"Generating speech with voice '{voice.name}' (ID: {voice_id}, speaker: {voice.speaker_id})")
+        
         try:
-            # Check if text is too long and should be split
-            if len(processed_text) > 200:
-                logger.info(f"Text is long ({len(processed_text)} chars), splitting for better quality")
-                from app.prompt_engineering import split_into_segments
-                # Split text into manageable segments
-                segments = split_into_segments(processed_text, max_chars=150)
-                logger.info(f"Split text into {len(segments)} segments")
-                all_audio_chunks = []
-                # Process each segment
-                for i, segment_text in enumerate(segments):
-                    logger.info(f"Generating segment {i+1}/{len(segments)}")
-                    # Generate this segment - using plain text without formatting
+            if is_dia:
+                # For Dia, we need to ensure speaker tag is appropriate for the voice
+                # The speaker ID needs to be mapped to either 0 (S1) or 1 (S2)
+                effective_speaker_id = voice.speaker_id % 2
+                logger.info(f"Using Dia with effective speaker ID: {effective_speaker_id}")
+                
+                audio = self.generator.generate(
+                    text=processed_text,
+                    speaker=effective_speaker_id,
+                    context=context,
+                    max_audio_length_ms=max_audio_length_ms,
+                    temperature=temperature,
+                    topk=topk
+                )
+            else:
+                # Original CSM approach
+                # Check if text is too long and should be split
+                if len(processed_text) > 200:
+                    logger.info(f"Long text detected ({len(processed_text)} chars), processing in segments")
+                    from app.prompt_engineering import split_into_segments
+                    sentences = split_into_segments(processed_text)
+                    logger.info(f"Split into {len(sentences)} segments")
+                    
+                    # Process sentences individually and concatenate the results
+                    all_audio_segments = []
+                    
+                    # Use the first sentence to establish voice
+                    first_sentence = sentences[0]
+                    
+                    # Generate the first segment
+                    logger.info("Generating first segment as voice context")
                     segment_audio = self.generator.generate(
-                        text=segment_text,  # Use plain text, no formatting
+                        text=first_sentence,
                         speaker=voice.speaker_id,
                         context=context,
                         max_audio_length_ms=min(max_audio_length_ms, 10000),
                         temperature=temperature,
                         topk=topk,
                     )
-                    all_audio_chunks.append(segment_audio)
-                    # Use this segment as context for the next one for consistency
-                    if i < len(segments) - 1:
-                        context = [
-                            Segment(
-                                text=segment_text,
-                                speaker=voice.speaker_id,
-                                audio=segment_audio
-                            )
-                        ]
-                # Combine chunks with small silence between them
-                if len(all_audio_chunks) == 1:
-                    audio = all_audio_chunks[0]
-                else:
+                    all_audio_segments.append(segment_audio)
+                    
+                    # Now process remaining sentences using the first as context
+                    for i, sentence in enumerate(sentences[1:], 1):
+                        logger.info(f"Generating segment {i+1}/{len(sentences)}")
+                        
+                        # Create a context segment from the previous generation
+                        prev_segment = Segment(
+                            speaker=voice.speaker_id,
+                            text=sentences[i-1],
+                            audio=all_audio_segments[-1]
+                        )
+                        
+                        # Generate this segment with previous as context
+                        segment_audio = self.generator.generate(
+                            text=sentence,
+                            speaker=voice.speaker_id,
+                            context=[prev_segment],
+                            max_audio_length_ms=min(max_audio_length_ms, 10000),
+                            temperature=temperature,
+                            topk=topk,
+                        )
+                        all_audio_segments.append(segment_audio)
+                    
+                    # Combine chunks with small silence between them
                     silence_samples = int(0.1 * self.sample_rate)  # 100ms silence
-                    silence = torch.zeros(silence_samples, device=all_audio_chunks[0].device)
+                    silence = torch.zeros(silence_samples, device=all_audio_segments[0].device)
+                    
                     # Join segments with silence
                     audio_parts = []
-                    for i, chunk in enumerate(all_audio_chunks):
+                    for i, chunk in enumerate(all_audio_segments):
                         audio_parts.append(chunk)
-                        if i < len(all_audio_chunks) - 1:  # Don't add silence after the last chunk
+                        if i < len(all_audio_segments) - 1:  # Don't add silence after the last chunk
                             audio_parts.append(silence)
+                    
                     # Concatenate all parts
                     audio = torch.cat(audio_parts)
-                return audio
-            else:
-                # For short text, generate directly - using plain text without formatting
-                audio = self.generator.generate(
-                    text=processed_text,  # Use plain text, no formatting
-                    speaker=voice.speaker_id,
-                    context=context,
-                    max_audio_length_ms=max_audio_length_ms,
-                    temperature=temperature,
-                    topk=topk,
-                )
-                return audio
+                else:
+                    # For shorter text, standard processing
+                    audio = self.generator.generate(
+                        text=processed_text,
+                        speaker=voice.speaker_id,
+                        context=context,
+                        max_audio_length_ms=max_audio_length_ms,
+                        temperature=temperature,
+                        topk=topk,
+                    )
+            return audio
+            
         except Exception as e:
             logger.error(f"Error generating speech with voice {voice_id}: {e}")
             raise
-            
+                
     def _preprocess_text(self, text: str) -> str:
         """Preprocess text for better pronunciation and voice cloning."""
         # Make sure text ends with punctuation for better phrasing

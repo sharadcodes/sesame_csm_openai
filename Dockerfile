@@ -5,16 +5,32 @@ RUN pip install huggingface_hub
 # Set working directory
 WORKDIR /model-downloader
 # Create directory for downloaded models
-RUN mkdir -p /model-downloader/models
+RUN mkdir -p /model-downloader/models/csm-1b
+RUN mkdir -p /model-downloader/models/dia-1.6b
+
 # This will run when building the image
 # You'll need to pass your Hugging Face token at build time
 ARG HF_TOKEN
 ENV HF_TOKEN=${HF_TOKEN}
-# Login and download model
+ARG TTS_ENGINE=csm
+
+# Login with token if provided
 RUN if [ -n "$HF_TOKEN" ]; then \
     huggingface-cli login --token ${HF_TOKEN}; \
-    huggingface-cli download sesame/csm-1b ckpt.pt --local-dir /model-downloader/models; \
-    else echo "No HF_TOKEN provided, model download will be skipped"; fi
+    fi
+
+# Download CSM-1B model
+RUN if [ -n "$HF_TOKEN" ] || [ "$TTS_ENGINE" = "csm" ]; then \
+    echo "Downloading CSM-1B model..."; \
+    huggingface-cli download sesame/csm-1b ckpt.pt --local-dir /model-downloader/models/csm-1b; \
+    else echo "Skipping CSM-1B model download"; fi
+
+# Download Dia-1.6B model
+RUN if [ -n "$HF_TOKEN" ] || [ "$TTS_ENGINE" = "dia" ]; then \
+    echo "Downloading Dia-1.6B model..."; \
+    huggingface-cli download nari-labs/Dia-1.6B config.json --local-dir /model-downloader/models/dia-1.6b; \
+    huggingface-cli download nari-labs/Dia-1.6B dia-v0_1.pth --local-dir /model-downloader/models/dia-1.6b; \
+    else echo "Skipping Dia-1.6B model download"; fi
 
 # Now for the main application stage
 FROM nvidia/cuda:12.4.0-base-ubuntu22.04
@@ -46,10 +62,12 @@ WORKDIR /app
 
 # Copy requirements first for better caching
 COPY requirements.txt .
+COPY requirements-dia.txt .
 
 # Create and set up persistent directories with proper permissions
-RUN mkdir -p /app/static /app/models /app/voice_memories /app/voice_references \
-    /app/voice_profiles /app/cloned_voices /app/audio_cache /app/tokenizers /app/logs && \
+RUN mkdir -p /app/static /app/models /app/models/csm-1b /app/models/dia-1.6b \
+    /app/voice_memories /app/voice_references /app/voice_profiles \
+    /app/cloned_voices /app/audio_cache /app/tokenizers /app/logs && \
     chmod -R 777 /app/voice_references /app/voice_profiles /app/voice_memories \
     /app/cloned_voices /app/audio_cache /app/static /app/logs /app/tokenizers /app/models
 
@@ -70,8 +88,16 @@ RUN git clone https://github.com/pytorch/torchtune.git /tmp/torchtune && \
     git checkout main && \
     pip install -e .
 
-# Install remaining dependencies
+# Install base requirements
 RUN pip3 install -r requirements.txt
+
+# Install Dia model dependencies if TTS_ENGINE is set to dia
+ARG TTS_ENGINE=csm
+RUN if [ "$TTS_ENGINE" = "dia" ]; then \
+    echo "Installing Dia model dependencies..." && \
+    pip3 install -r requirements-dia.txt && \
+    echo "Dia model dependencies installed"; \
+fi
 
 # Install additional dependencies for streaming and voice cloning
 RUN pip3 install yt-dlp openai-whisper
@@ -79,8 +105,9 @@ RUN pip3 install yt-dlp openai-whisper
 # Copy application code
 COPY ./app /app/app
 
-# Copy downloaded model from the model-downloader stage
-COPY --from=model-downloader /model-downloader/models /app/models
+# Copy downloaded models from the model-downloader stage
+COPY --from=model-downloader /model-downloader/models/csm-1b /app/models/csm-1b
+COPY --from=model-downloader /model-downloader/models/dia-1.6b /app/models/dia-1.6b
 
 # Show available models in torchtune
 RUN python3 -c "import torchtune.models; print('Available models in torchtune:', dir(torchtune.models))"
