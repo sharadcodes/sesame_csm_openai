@@ -33,7 +33,7 @@ RUN if [ -n "$HF_TOKEN" ] || [ "$TTS_ENGINE" = "dia" ]; then \
     else echo "Skipping Dia-1.6B model download"; fi
 
 # Now for the main application stage
-FROM nvidia/cuda:12.4.0-base-ubuntu22.04
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 # Set environment variables
 ENV PYTHONFAULTHANDLER=1 \
     PYTHONUNBUFFERED=1 \
@@ -79,6 +79,7 @@ RUN pip3 install --no-cache-dir --upgrade pip && \
     pip3 install torch torchaudio numpy
 
 # Install torchao from source
+ENV CUDA_HOME=/usr/local/cuda
 RUN pip3 install git+https://github.com/pytorch/ao.git
 
 # Install torchtune from source with specific branch for latest features

@@ -90,7 +90,7 @@ async def generate_speech(
     max_audio_length_ms = speech_request.max_audio_length_ms
     
     # Log request details
-    logger.info(f"TTS request: text length={len(input_text)}, voice={voice}, format={response_format}")
+    logger.info(f"TTS request: text length={len(input_text)}, voice={voice}, format={response_format}, model={model}")
     
     try:
         # Get speaker ID for the voice - with Dia-specific handling
@@ -220,6 +220,9 @@ async def generate_speech(
             sample_rate, 
             request.app.state
         )
+        
+        # Log successful response
+        logger.info(f"TTS response: {len(response_data)} bytes, {response_format} format, voice={voice}")
         
         # Create and return the response
         return Response(

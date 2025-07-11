@@ -27,6 +27,7 @@ class TTSEngine(Enum):
 
 # Setup logging
 os.makedirs("logs", exist_ok=True)
+os.makedirs("/app/logs", exist_ok=True)  # Ensure container logs directory exists
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 # Console handler
 console_handler = logging.StreamHandler()
@@ -607,10 +608,11 @@ app.include_router(streaming_router, prefix="/v1")
 async def add_process_time_header(request: Request, call_next):
     """Middleware to track request processing time."""
     start_time = time.time()
+    logger.info(f"Incoming request: {request.method} {request.url.path}")
     response = await call_next(request)
     process_time = time.time() - start_time
     response.headers["X-Process-Time"] = str(process_time)
-    logger.debug(f"Request to {request.url.path} processed in {process_time:.3f} seconds")
+    logger.info(f"Request to {request.url.path} processed in {process_time:.3f} seconds")
     return response
 
 # Health check endpoint
@@ -709,7 +711,7 @@ async def available_models():
 @app.get("/", include_in_schema=False)
 async def root():
     """Root endpoint that redirects to docs."""
-    logger.debug("Root endpoint accessed, redirecting to docs")
+    logger.info("Root endpoint accessed, redirecting to docs")
     return RedirectResponse(url="/docs")
 
 if __name__ == "__main__":
