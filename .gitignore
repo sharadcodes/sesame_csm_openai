@@ -26,6 +26,7 @@ wheels/
 env/
 venv/
 ENV/
+test_env/
 
 # Model & data files
 models/

@@ -37,7 +37,54 @@ Key environment variables for configuration:
 - `LOG_LEVEL`: Set logging level (INFO, DEBUG, WARNING, ERROR)
 
 ### Testing
-No formal test suite is present. Test using the API endpoints directly:
+
+The project now includes a comprehensive test suite using pytest. Run tests with:
+
+```bash
+# Run all tests
+pytest
+
+# Run with coverage report
+pytest --cov=app --cov-report=html --cov-report=term
+
+# Run only unit tests
+pytest -m unit
+
+# Run only integration tests
+pytest -m integration
+
+# Run tests in parallel (faster)
+pytest -n auto
+
+# Run with verbose output
+pytest -v
+
+# Run a specific test file
+pytest tests/unit/test_schemas.py
+
+# Run tests with specific markers
+pytest -m "not gpu"  # Skip GPU tests
+pytest -m "not slow"  # Skip slow tests
+```
+
+#### Test Structure
+- **Unit Tests** (`tests/unit/`): Test individual components in isolation
+  - `test_schemas.py`: API request/response validation
+  - `test_text_normalizer.py`: Text processing and normalization
+  - `test_prompt_engineering.py`: Voice formatting and segmentation
+  - `test_audio_utils.py`: Audio format conversion
+  - `test_voice_cloning.py`: Voice cloning system (mocked)
+  - `test_generator.py`: TTS generator (mocked)
+  
+- **Integration Tests** (`tests/integration/`):
+  - `test_api_routes.py`: Full API endpoint testing with mocked backends
+
+- **Test Configuration**:
+  - `pytest.ini`: Pytest configuration and markers
+  - `conftest.py`: Shared fixtures and test setup
+
+#### Manual Testing
+For manual testing of the live API:
 ```bash
 # Health check
 curl http://localhost:8000/health
@@ -147,8 +194,19 @@ Voice data is persisted across container restarts using Docker volumes.
 
 ## Development Notes
 
-- **No Traditional Tests**: Use API endpoints for testing functionality
+- **Comprehensive Test Suite**: Full pytest-based test coverage with unit and integration tests
 - **Docker-First**: Designed to run in containerized environment
 - **GPU Required**: Optimal performance requires CUDA-capable GPU
 - **Model Downloads**: Models are downloaded at build time or runtime
 - **Persistent Storage**: Important data stored in Docker volumes for persistence
+
+## Testing Best Practices
+
+When adding new features or fixing bugs:
+
+1. **Write Tests First**: Follow TDD principles when possible
+2. **Mock Heavy Dependencies**: Mock GPU operations, model loading, and external APIs
+3. **Test Edge Cases**: Include tests for error conditions and boundary values
+4. **Maintain Coverage**: Aim for >80% code coverage on new code
+5. **Use Fixtures**: Leverage pytest fixtures in `conftest.py` for common test needs
+6. **Mark Tests Appropriately**: Use markers (unit, integration, gpu, slow) to categorize tests
