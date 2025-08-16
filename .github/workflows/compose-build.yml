@@ -34,6 +34,5 @@ jobs:
       
       - name: Tag and Push Images
         run: |
-          docker tag <service-image-1> ghcr.io/${{ github.repository }}-service1:latest
-          docker push ghcr.io/${{ github.repository }}-service1:latest
-          # Repeat for other services
+          docker tag sesame_csm_openai-csm-api ghcr.io/${{ github.repository }}/csm-api:latest
+          docker push ghcr.io/${{ github.repository }}/csm-api:latest
